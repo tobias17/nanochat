@@ -7,6 +7,7 @@ Example tasks: MMLU, ARC-Easy, ARC-Challenge, GSM8K, HumanEval, SmolTalk.
 
 import os
 import json
+import hashlib
 import random
 import urllib.request
 
@@ -87,6 +88,9 @@ class Task:
     Base class of a Task. Allows for lightweight slicing of the underlying dataset.
     """
 
+    ref_key = None  # name of this dataset's precomputed wiki refs (see attach_refs), set by subclasses
+    ref_ids = None  # (num_examples, n_ref) wiki chunk ids per example, set by attach_refs
+
     def __init__(self, start=0, stop=None, step=1):
         # allows a lightweight logical view over a dataset
         assert start >= 0, f"Start must be non-negative, got {start}"
@@ -107,6 +111,11 @@ class Task:
     def get_example(self, index):
         raise NotImplementedError
 
+    def retrieval_query(self, index):
+        """ Text to retrieve wiki refs with for example `index` (same index space as get_example):
+        the question/user prompt only, never the answer, choices or system prompt. """
+        raise NotImplementedError
+
     def __len__(self):
         start = self.start
         stop = self.num_examples() if self.stop is None else self.stop
@@ -120,10 +129,50 @@ class Task:
         assert isinstance(index, int), f"Index must be an integer, got {type(index)}"
         physical_index = self.start + index * self.step
         conversation = self.get_example(physical_index)
+        if self.ref_ids is not None:
+            conversation["ref_ids"] = self.ref_ids[physical_index].tolist()
         return conversation
 
     def evaluate(self, problem, completion):
         raise NotImplementedError
+
+
+REFS_DIR = os.path.join(get_base_dir(), "task_refs")
+
+def wiki_num_chunks():
+    with open(os.path.join(get_base_dir(), "wiki", "config.json")) as f:
+        return json.load(f)["num_chunks"]
+
+def queries_hash(task, n=1000):
+    """ Fingerprint of a task's first n retrieval queries, to catch refs that no longer match the dataset order. """
+    h = hashlib.sha256()
+    for i in range(min(n, task.num_examples())):
+        h.update(task.retrieval_query(i).encode("utf-8"))
+        h.update(b"\0")
+    return h.hexdigest()
+
+def attach_refs(task):
+    """
+    Make task[i] also return conversation["ref_ids"], the wiki chunk ids precomputed for it by
+    `python -m scripts.wiki_retrieve tasks`. For a TaskMixture/TaskSequence, attaches to each subtask.
+    """
+    if hasattr(task, "tasks"):
+        for subtask in task.tasks:
+            attach_refs(subtask)
+        return task
+    assert task.ref_key is not None, f"{type(task).__name__} has no ref_key"
+    with open(os.path.join(REFS_DIR, f"{task.ref_key}.json")) as f:
+        meta = json.load(f)
+    ref_ids = np.load(os.path.join(REFS_DIR, f"{task.ref_key}_ids.npy"))
+    assert ref_ids.shape[0] == meta["n"] == task.num_examples(), (
+        f"{task.ref_key}: refs have {ref_ids.shape[0]} rows but the dataset has {task.num_examples()}; rerun wiki_retrieve tasks")
+    assert meta["queries_sha256"] == queries_hash(task), (
+        f"{task.ref_key}: dataset queries changed since the refs were computed; rerun wiki_retrieve tasks")
+    assert meta["n_chunks"] == wiki_num_chunks(), (
+        f"{task.ref_key}: refs index a {meta['n_chunks']}-chunk wiki but the current one has {wiki_num_chunks()}; "
+        f"rerun wiki_retrieve tasks")
+    task.ref_ids = ref_ids
+    return task
 
 
 class TaskMixture(Task):

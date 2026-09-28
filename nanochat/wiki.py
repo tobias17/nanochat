@@ -362,6 +362,55 @@ class WikiIndex:
         return top_idx.numpy(), top_vals.numpy()
 
 # -----------------------------------------------------------------------------
+# Distinct-article retrieval
+
+def top_distinct_articles(raw_idx, raw_scores, chunk_article, k):
+    """
+    raw_idx/raw_scores: (Q, K) score-sorted (descending) chunk ids and scores. Keeps each article's best
+    chunk, in score order, up to k per query. Returns (ids (Q, k) int32, scores (Q, k) float32), padded
+    with -1 / -1e9 when a query has fewer than k distinct articles.
+    """
+    Q = raw_idx.shape[0]
+    raw_articles = chunk_article[raw_idx]
+    ids = np.full((Q, k), -1, dtype=np.int32)
+    scores = np.full((Q, k), -1e9, dtype=np.float32)
+    for i in range(Q):
+        # first hit per article is its best, since raw_idx is score-sorted; keep those in score order
+        _, first = np.unique(raw_articles[i], return_index=True)
+        keep = np.sort(first)[:k]
+        ids[i, :len(keep)] = raw_idx[i, keep]
+        scores[i, :len(keep)] = raw_scores[i, keep]
+    return ids, scores
+
+class Retriever:
+    """ Query text -> n_ref chunks from n_ref distinct wiki articles. Used for offline SFT/eval ref
+    precompute and for live chat, so both retrieve identically. """
+    def __init__(self, index_gpus, embed_device, n_ref=8, cand_k=128, dtype="fp16"):
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        from sentence_transformers import SentenceTransformer
+        self.n_ref, self.cand_k = n_ref, cand_k
+        self.model = SentenceTransformer(EMBED_MODEL_NAME, device=embed_device)
+        self.index = WikiIndex(dtype=dtype, gpus=index_gpus)
+        self.chunk_article = np.load(os.path.join(WIKI_DIR, "meta.npy"))[:, 0]
+        self.tokens = np.load(os.path.join(WIKI_DIR, "tokens.npy"), mmap_mode="r")
+
+    def retrieve(self, texts, batch_size=256):
+        """ Returns (ids (Q, n_ref) int32, scores (Q, n_ref) float32); -1 id = fewer than n_ref distinct articles. """
+        ids, scores = [], []
+        for bstart in range(0, len(texts), batch_size):
+            vecs = self.model.encode(texts[bstart:bstart + batch_size], normalize_embeddings=True, show_progress_bar=False)
+            raw_idx, raw_scores = self.index.search(vecs, self.cand_k)
+            i, s = top_distinct_articles(raw_idx, raw_scores, self.chunk_article, self.n_ref)
+            ids.append(i)
+            scores.append(s)
+        return np.concatenate(ids), np.concatenate(scores)
+
+    def ref_tokens(self, ids):
+        """ (n_ref,) chunk ids -> (n_ref, chunk_len) uint16 token array. """
+        assert all(i >= 0 for i in ids), f"missing refs (-1) in {ids}"
+        return np.stack([self.tokens[i] for i in ids])
+
+# -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build the Wikipedia retrieval corpus")

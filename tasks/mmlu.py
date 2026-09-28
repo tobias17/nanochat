@@ -16,6 +16,7 @@ class MMLU(Task):
         assert split in ["auxiliary_train", "validation", "dev", "test"], f"split {split} must be auxiliary_train|validation|dev|test"
         self.subset = subset
         self.split = split
+        self.ref_key = f"mmlu_{subset}_{split}"
         self.ds = load_hub_dataset("cais/mmlu", subset, split=split).shuffle(seed=42)
 
     @property
@@ -24,6 +25,9 @@ class MMLU(Task):
 
     def num_examples(self):
         return len(self.ds)
+
+    def retrieval_query(self, index):
+        return self.ds[index]["question"]
 
     def get_example(self, index):
         row = self.ds[index]

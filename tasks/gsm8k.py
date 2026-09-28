@@ -40,6 +40,7 @@ class GSM8K(Task):
         assert subset in ["main", "socratic"], "GSM8K subset must be main|socratic"
         assert split in ["train", "test"], "GSM8K split must be train|test"
         self.ds = load_hub_dataset("openai/gsm8k", subset, split=split).shuffle(seed=42)
+        self.ref_key = f"gsm8k_{subset}_{split}"
 
     @property
     def eval_type(self):
@@ -47,6 +48,9 @@ class GSM8K(Task):
 
     def num_examples(self):
         return len(self.ds)
+
+    def retrieval_query(self, index):
+        return self.ds[index]["question"]
 
     def get_example(self, index):
         """ Get a single problem from the dataset. """

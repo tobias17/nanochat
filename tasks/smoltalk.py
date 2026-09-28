@@ -14,9 +14,13 @@ class SmolTalk(Task):
         assert split in ["train", "test"], "SmolTalk split must be train|test"
         self.ds = load_hub_dataset("HuggingFaceTB/smol-smoltalk", split=split).shuffle(seed=42)
         self.length = len(self.ds)
+        self.ref_key = f"smoltalk_{split}"
 
     def num_examples(self):
         return self.length
+
+    def retrieval_query(self, index):
+        return next(m["content"] for m in self.ds[index]["messages"] if m["role"] == "user")
 
     def get_example(self, index):
         row = self.ds[index]

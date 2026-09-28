@@ -9,11 +9,13 @@
 #   embed_windows  embed each packed row's 8 windows of 256 tokens with mpnet                   GPU, per split
 #   search         top distinct-article wiki candidates for every window                        GPU (index sharded), per split
 #   dedup          article-level dedup per row, then fill the rows' 8x256 reference columns     CPU, per split
+#   task_refs      8 distinct-article wiki refs per SFT / eval conversation, on its question    GPU (index on 3, mpnet on 1)
 #
 # Each stage leaves a marker when it completes, so rerunning this script skips finished work and continues where
 # it stopped. The two embed stages also resume mid-way after a crash. Re-packing a split deletes that split's
 # downstream outputs, since they'd be stale. Output: $NANOCHAT_BASE_DIR/packed/{train,val}.npy (+ wiki/ and
-# retrieval side files), read by the packed loader in nanochat/dataloader.py.
+# retrieval side files), read by the packed loader in nanochat/dataloader.py. $NANOCHAT_BASE_DIR/task_refs/ holds
+# the SFT / eval conversations' refs, attached with tasks.common.attach_refs.
 #
 # Usage:
 #   bash runs/data.sh                                  # every stage that isn't done yet
@@ -25,7 +27,7 @@
 
 source "$(dirname "$0")/common.sh"
 
-STAGES="${STAGES:-setup wiki_build pack wiki_embed embed_windows search dedup}"
+STAGES="${STAGES:-setup wiki_build pack wiki_embed embed_windows search dedup task_refs}"
 SPLITS="${SPLITS:-val train}"
 PACK_DIR="$NANOCHAT_BASE_DIR/packed"
 WIKI_DIR="$NANOCHAT_BASE_DIR/wiki"
@@ -133,6 +135,12 @@ if want dedup; then
         need "$PACK_DIR/.${split}_search.done"
         stage "$PACK_DIR/.${split}_dedup.done" python -m scripts.wiki_retrieve dedup --split "$split"
     done
+fi
+
+if want task_refs; then
+    need "$WIKI_DIR/.embed.done"
+    [ -f "$NANOCHAT_BASE_DIR/task_refs/.done" ] || require_free_gpus
+    stage "$NANOCHAT_BASE_DIR/task_refs/.done" python -m scripts.wiki_retrieve tasks
 fi
 
 log "Data stages finished: $STAGES (splits: $SPLITS)"

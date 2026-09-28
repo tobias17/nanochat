@@ -6,6 +6,7 @@ row, show its 8 document windows next to the Wikipedia chunk retrieved for each.
     python -m scripts.wiki_view --split train --start 100
     python -m scripts.wiki_view --split train --stats
     python -m scripts.wiki_view --query "some text"
+    python -m scripts.wiki_view --task gsm8k_main_test [--stats]   # SFT/eval conversations' refs (see wiki_retrieve tasks)
 
 Controls: Enter = next row, q = quit, a<N> = jump to row N, r = random.
 """
@@ -23,6 +24,7 @@ import pyarrow.parquet as pq
 from nanochat.tokenizer import get_tokenizer
 from nanochat.pack import PACK_DIR, DOC_WIDTH, NUM_WINDOWS, WINDOW_LEN, packed_path
 from nanochat.wiki import WIKI_DIR, EMBED_MODEL_NAME, WikiIndex
+from tasks.common import REFS_DIR
 
 # -----------------------------------------------------------------------------
 # Terminal styling (disabled automatically when stdout isn't a real terminal,
@@ -228,6 +230,46 @@ def query_mode(query_text, args):
         print(wrap(chunk_text))
         print()
 
+def task_mode(key, args):
+    """ Page through a task's queries, each with its precomputed refs. """
+    from scripts.wiki_retrieve import _ref_tasks
+    task = _ref_tasks()[key]()
+    ids = np.load(os.path.join(REFS_DIR, f"{key}_ids.npy"))
+    scores = np.load(os.path.join(REFS_DIR, f"{key}_scores.npy"))
+    if args.stats:
+        valid = scores[scores > -1e8]
+        print(f"{key}: {len(ids)} queries x {ids.shape[1]} refs, {int((ids < 0).any(axis=1).sum())} queries with missing refs")
+        print("score percentiles p1/p5/p25/p50/p75/p95:", np.percentile(valid, [1, 5, 25, 50, 75, 95]).round(3).tolist())
+        print("best-ref score p5/p50/p95:", np.percentile(scores[:, 0], [5, 50, 95]).round(3).tolist())
+        return
+    lookup = WikiLookup()
+    n = len(ids)
+    order = list(range(args.start, n))
+    if args.random:
+        random.shuffle(order)
+    pos = 0
+    while 0 <= pos < len(order):
+        i = order[pos]
+        print(f"{BOLD_CYAN}=== {key}[{i}] ==={RESET}")
+        print(wrap(task.retrieval_query(i)[:1500]))
+        print()
+        for chunk_id, score in zip(ids[i].tolist(), scores[i].tolist()):
+            if chunk_id < 0:
+                print(f"  {BOLD_RED}→ missing ref{RESET}")
+                continue
+            title, chunk_idx, text = lookup.describe(chunk_id)
+            print(f"  {BOLD}{title}{RESET} #{chunk_idx}  {score_color(score)}{score:.3f}{RESET}")
+            print(f"  {DIM}{wrap(text[:300], _terminal_width(6)).replace(chr(10), chr(10) + '  ')}{RESET}")
+        print()
+        cmd = input(f"{DIM}[Enter=next, q=quit, a<N>=jump, r=random]{RESET} > ").strip().lower()
+        if cmd == "q":
+            break
+        elif cmd == "r":
+            order.insert(pos + 1, random.randrange(n))
+        elif cmd.startswith("a") and cmd[1:].isdigit() and int(cmd[1:]) < n:
+            order.insert(pos + 1, int(cmd[1:]))
+        pos += 1
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Inspect the packed-row <-> Wikipedia retrieval join")
     parser.add_argument("--split", choices=["train", "val"], default="train")
@@ -239,9 +281,12 @@ if __name__ == "__main__":
     parser.add_argument("--k", type=int, default=4, help="Neighbours to show (for --query)")
     parser.add_argument("--dtype", choices=["fp16", "int8"], default="fp16", help="Which wiki embedding index to load (for --query)")
     parser.add_argument("--gpu", type=int, default=0, help="GPU to run the embedding model on (for --query)")
+    parser.add_argument("--task", type=str, default=None, help="Show a task's precomputed refs by ref_key, e.g. smoltalk_train")
     args = parser.parse_args()
 
-    if args.query is not None:
+    if args.task is not None:
+        task_mode(args.task, args)
+    elif args.query is not None:
         query_mode(args.query, args)
     elif args.stats:
         print_stats(args.split)

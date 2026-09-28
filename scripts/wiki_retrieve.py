@@ -9,6 +9,11 @@ build + embed:
     python -m scripts.wiki_retrieve search-merge --split train
     python -m scripts.wiki_retrieve dedup --split train
 
+and one more for SFT / eval conversations, which get 8 distinct-article refs each, retrieved on the
+question / user prompt (see Task.retrieval_query):
+
+    python -m scripts.wiki_retrieve tasks   # writes <base_dir>/task_refs/{ref_key}_{ids,scores}.npy + {ref_key}.json
+
 Writes, under <base_dir>/packed/:
   {split}_qemb.npy         (R*8, dim) fp16    -- window embeddings
   {split}_cand_ids.npy      (R, 8, 32) int32   -- top distinct-article wiki chunk ids per window, score-sorted
@@ -18,6 +23,7 @@ Writes, under <base_dir>/packed/:
 and fills the wiki-reference columns of {split}.npy in place.
 """
 import os
+import json
 import time
 import argparse
 import itertools
@@ -26,7 +32,7 @@ import numpy as np
 
 from nanochat.tokenizer import get_tokenizer
 from nanochat.pack import PACK_DIR, DOC_WIDTH, NUM_WINDOWS, WINDOW_LEN, packed_path
-from nanochat.wiki import WIKI_DIR, EMBED_MODEL_NAME, embed_rows_to_memmap
+from nanochat.wiki import WIKI_DIR, EMBED_MODEL_NAME, embed_rows_to_memmap, top_distinct_articles
 
 CAND_K = 128    # raw nearest chunks fetched per window before collapsing to distinct articles
 ARTICLE_K = 32  # distinct-article candidates kept per window after collapsing (8 windows can never need more than 8)
@@ -158,16 +164,7 @@ def search_merge(split, world_size=6, merge_batch=200_000):
         order = np.argsort(-score_cat, axis=1)[:, :CAND_K]
         raw_idx = np.take_along_axis(idx_cat, order, axis=1)
         raw_scores = np.take_along_axis(score_cat, order, axis=1)
-        raw_articles = chunk_article[raw_idx]
-
-        batch_ids = np.full((bend - bstart, ARTICLE_K), -1, dtype=np.int32)
-        batch_scores = np.full((bend - bstart, ARTICLE_K), -1e9, dtype=np.float32)
-        for i in range(bend - bstart):
-            # first hit per article is its best, since raw_idx is score-sorted; keep those in score order
-            _, first = np.unique(raw_articles[i], return_index=True)
-            keep = np.sort(first)[:ARTICLE_K]
-            batch_ids[i, :len(keep)] = raw_idx[i, keep]
-            batch_scores[i, :len(keep)] = raw_scores[i, keep]
+        batch_ids, batch_scores = top_distinct_articles(raw_idx, raw_scores, chunk_article, ARTICLE_K)
         cand_ids_flat[bstart:bend] = batch_ids
         cand_scores_flat[bstart:bend] = batch_scores
         if (bstart // merge_batch) % 5 == 0 or bend == n:
@@ -252,6 +249,67 @@ def dedup_and_fill(split):
     print(f"Deduped {R} rows ({n_displaced} total displacements), filled wiki columns in {packed_path(split)}")
 
 # -----------------------------------------------------------------------------
+# SFT / eval conversations
+
+def _ref_tasks():
+    from tasks.smoltalk import SmolTalk
+    from tasks.mmlu import MMLU
+    from tasks.gsm8k import GSM8K
+    from tasks.arc import ARC
+    from tasks.humaneval import HumanEval
+    return {
+        "humaneval_test": lambda: HumanEval(),
+        "gsm8k_main_test": lambda: GSM8K("main", "test"),
+        "arc_ARC-Easy_test": lambda: ARC("ARC-Easy", "test"),
+        "arc_ARC-Challenge_test": lambda: ARC("ARC-Challenge", "test"),
+        "mmlu_all_test": lambda: MMLU("all", "test"),
+        "smoltalk_test": lambda: SmolTalk("test"),
+        "gsm8k_main_train": lambda: GSM8K("main", "train"),
+        "mmlu_all_auxiliary_train": lambda: MMLU("all", "auxiliary_train"),
+        "smoltalk_train": lambda: SmolTalk("train"),
+    }  # smallest first, so problems show up early
+
+def retrieve_tasks(keys=None, index_gpus=(0, 1, 2), embed_gpu=3, n_ref=8, batch_size=256, force=False):
+    """ Retrieve n_ref distinct-article wiki chunks for every example of each task, in one process.
+    Keys whose {key}.json exists are skipped unless force, so a crashed run resumes. """
+    from nanochat.wiki import Retriever
+    from tasks.common import REFS_DIR, queries_hash
+
+    ref_tasks = _ref_tasks()
+    keys = list(ref_tasks) if not keys else keys
+    for key in keys:
+        assert key in ref_tasks, f"unknown key {key}, choose from {list(ref_tasks)}"
+    os.makedirs(REFS_DIR, exist_ok=True)
+    meta_path = lambda key: os.path.join(REFS_DIR, f"{key}.json")
+    if not force:
+        for key in [k for k in keys if os.path.exists(meta_path(k))]:
+            print(f"{key}: already done, skipping (--force to redo)", flush=True)
+        keys = [k for k in keys if not os.path.exists(meta_path(k))]
+    if not keys:
+        return
+    retriever = Retriever(list(index_gpus), f"cuda:{embed_gpu}", n_ref=n_ref, cand_k=CAND_K)
+
+    for key in keys:
+        if os.path.exists(meta_path(key)):
+            os.remove(meta_path(key))  # a crash mid-rewrite must not leave the old marker next to new arrays
+        task = ref_tasks[key]()
+        assert task.ref_key == key, f"{key} vs task.ref_key {task.ref_key}"
+        n = task.num_examples()
+        t0 = time.time()
+        queries = [task.retrieval_query(i) for i in range(n)]
+        ids, scores = retriever.retrieve(queries, batch_size=batch_size)
+        n_short = int((ids < 0).any(axis=1).sum())
+        np.save(os.path.join(REFS_DIR, f"{key}_ids.npy"), ids)
+        np.save(os.path.join(REFS_DIR, f"{key}_scores.npy"), scores)
+        meta = {"n": n, "n_ref": n_ref, "embed_model": EMBED_MODEL_NAME, "n_chunks": int(retriever.index.n),
+                "queries_sha256": queries_hash(task)}
+        with open(meta_path(key), "w") as f:  # written last: doubles as the completion marker
+            json.dump(meta, f)
+        valid = scores[scores > -1e8]
+        print(f"{key}: {n} queries in {time.time() - t0:.0f}s ({n / max(time.time() - t0, 1e-6):.0f}/s), "
+              f"{n_short} with <{n_ref} articles, score p5/p50/p95 = {np.percentile(valid, [5, 50, 95]).round(3).tolist()}", flush=True)
+
+# -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Join packed rows' windows to Wikipedia, with article-level dedup")
@@ -280,6 +338,13 @@ if __name__ == "__main__":
     p_dedup = sub.add_parser("dedup", help="Resolve article-level conflicts and fill the packed rows' wiki columns")
     p_dedup.add_argument("--split", choices=["train", "val"], required=True)
 
+    p_t = sub.add_parser("tasks", help="Retrieve wiki refs for SFT / eval task conversations")
+    p_t.add_argument("--keys", nargs="*", default=None, help="Task ref keys to do (default: all)")
+    p_t.add_argument("--force", action="store_true", help="Redo keys that are already done")
+    p_t.add_argument("--index-gpus", type=int, nargs="+", default=[0, 1, 2], help="GPUs holding the wiki index (fp16 needs about 3 x 24GB)")
+    p_t.add_argument("--embed-gpu", type=int, default=3, help="GPU for the query embedding model")
+    p_t.add_argument("--batch-size", type=int, default=256)
+
     args = parser.parse_args()
     if args.command == "embed-windows":
         embed_windows(args.split, batch_size=args.batch_size, rank=args.rank, world_size=args.world_size, gpu=args.gpu)
@@ -290,3 +355,5 @@ if __name__ == "__main__":
         search_merge(args.split, world_size=args.world_size)
     elif args.command == "dedup":
         dedup_and_fill(args.split)
+    elif args.command == "tasks":
+        retrieve_tasks(args.keys, args.index_gpus, args.embed_gpu, batch_size=args.batch_size, force=args.force)

@@ -15,7 +15,7 @@
 #   pretrain  base_train, checkpointing every SAVE_EVERY steps to base_checkpoints/<arm>_d<depth>
 #   eval      base_eval: train/val bpb on the packed rows. CORE and sampling are skipped for now: for the
 #             reference arms they need refs retrieved for their prompts at eval time, which isn't wired up yet
-#   sft       placeholder: SFT needs its conversations paired with refs retrieved on the user prompt first
+#   sft       placeholder: SFT conversations have precomputed refs (data.sh task_refs), but chat_sft.py doesn't use them yet
 #
 # Logs and results.csv: $NANOCHAT_BASE_DIR/experiments/train/
 
@@ -80,7 +80,7 @@ if want eval; then
 fi
 
 if want sft; then
-    die "SFT for the reference arms isn't implemented yet: the SFT conversations need refs retrieved on their user prompts first"
+    die "SFT for the reference arms isn't implemented yet: the refs are precomputed (data.sh task_refs), but chat_sft.py doesn't load them yet"
 fi
 
 log "Done: $TAG ($STAGES)"

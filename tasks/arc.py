@@ -12,6 +12,7 @@ class ARC(Task):
         assert subset in ["ARC-Easy", "ARC-Challenge"], "ARC subset must be ARC-Easy or ARC-Challenge"
         assert split in ["train", "validation", "test"], "ARC split must be train|validation|test"
         self.ds = load_hub_dataset("allenai/ai2_arc", subset, split=split).shuffle(seed=42)
+        self.ref_key = f"arc_{subset}_{split}"
 
     @property
     def eval_type(self):
@@ -19,6 +20,9 @@ class ARC(Task):
 
     def num_examples(self):
         return len(self.ds)
+
+    def retrieval_query(self, index):
+        return self.ds[index]["question"]
 
     def get_example(self, index):
         row = self.ds[index]

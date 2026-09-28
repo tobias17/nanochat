@@ -49,6 +49,7 @@ class HumanEval(Task):
         super().__init__(**kwargs)
         # note: this dataset has no named subsets, its parquet config on the hub is "openai_humaneval"
         self.ds = load_hub_dataset("openai/openai_humaneval", subset="openai_humaneval", split="test").shuffle(seed=42)
+        self.ref_key = "humaneval_test"
 
     @property
     def eval_type(self):
@@ -56,6 +57,9 @@ class HumanEval(Task):
 
     def num_examples(self):
         return len(self.ds)
+
+    def retrieval_query(self, index):
+        return self.ds[index]["prompt"]
 
     def get_example(self, index):
         """ Get a single problem from the dataset. """
