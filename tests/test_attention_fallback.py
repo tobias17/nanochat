@@ -271,6 +271,26 @@ class TestSDPAOnly:
         assert not torch.isnan(y).any(), "Output contains NaN"
         set_impl(None)
 
+    def test_non_causal(self):
+        """Test SDPA fallback with causal=False (encoder / cross-attention): full bidirectional
+        attention, and Tq != Tk (as in cross-attention over a fixed-size reference memory)."""
+        set_impl('sdpa')
+        B, Tq, Tk, H, D = 2, 8, 32, 4, 16
+        q = torch.randn(B, Tq, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B, Tk, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B, Tk, H, D, device=self.DEVICE, dtype=self.DTYPE)
+
+        y = flash_attn.flash_attn_func(q, k, v, causal=False, window_size=(-1, -1))
+        assert y.shape == (B, Tq, H, D)
+        assert not torch.isnan(y).any(), "Output contains NaN"
+
+        # Manual reference: unmasked attention
+        import torch.nn.functional as F
+        q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        y_ref = F.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=False).transpose(1, 2)
+        assert_close(y, y_ref, "non_causal (manual ref)")
+        set_impl(None)
+
     def test_backward(self):
         """Test gradients flow through SDPA."""
         set_impl('sdpa')

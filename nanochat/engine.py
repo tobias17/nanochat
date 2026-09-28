@@ -102,11 +102,15 @@ class KVCache:
         self.cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
         # Previous token's normalized embedding for smear (set by model forward pass)
         self.prev_embedding = None
+        # Cross-attention k/v, keyed by layer_idx (ref_mode="encoder" only). References are
+        # fixed for the whole generation, so these are projected once at prefill and reused.
+        self.cross_kv = {}
 
     def reset(self):
         """Reset cache to empty state."""
         self.cache_seqlens.zero_()
         self.prev_embedding = None
+        self.cross_kv = {}
 
     def get_pos(self):
         """Get current position (assumes all batch elements at same position)."""
@@ -135,6 +139,11 @@ class KVCache:
         # Copy smear state: expand batch=1 prev_embedding to num_samples
         if other.prev_embedding is not None:
             self.prev_embedding = other.prev_embedding.expand(self.batch_size, -1, -1).clone()
+        # Copy cross-attn k/v the same way (batch=1 -> num_samples)
+        self.cross_kv = {
+            layer_idx: tuple(t.expand(self.batch_size, -1, -1, -1).clone() for t in kv)
+            for layer_idx, kv in other.cross_kv.items()
+        }
 
 # -----------------------------------------------------------------------------
 @torch.inference_mode()
@@ -173,8 +182,9 @@ class Engine:
         self.tokenizer = tokenizer # needed for tool use
 
     @torch.inference_mode()
-    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
-        """Same as generate, but does single prefill and then clones the KV cache."""
+    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42, refs=None):
+        """Same as generate, but does single prefill and then clones the KV cache.
+        refs: optional list of n_ref reference chunks (each a list of ref_len ints), for ref_mode != "none"."""
         assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
         device = self.model.get_device()
         # Allocate the KV cache in the compute dtype so it matches what the forward pass emits
@@ -194,19 +204,22 @@ class Engine:
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
         kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+        # In "prefix" mode the refs are prepended to the prompt, so they take up KV cache slots too
+        num_prefix = m.n_ref * m.ref_len if m.ref_mode == "prefix" else 0
         kv_cache_prefill = KVCache(
             batch_size=1,
-            seq_len=len(tokens),
+            seq_len=num_prefix + len(tokens),
             device=device,
             dtype=dtype,
             **kv_model_kwargs,
         )
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
+        refs = torch.tensor([refs], dtype=torch.long, device=device) if refs is not None else None # add batch dim
+        logits = self.model.forward(ids, kv_cache=kv_cache_prefill, refs=refs)
         logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
 
         # 2) Replicate the KV cache for each sample/row
-        kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
+        kv_length_hint = num_prefix + ((len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len)
         kv_cache_decode = KVCache(
             batch_size=num_samples,
             seq_len=kv_length_hint,

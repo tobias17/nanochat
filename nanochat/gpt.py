@@ -37,6 +37,14 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Reference/"cheat sheet" context: "none" (plain decoder), "prefix" (baseline: refs
+    # concatenated before idx, loss only on idx), "encoder" (cheat_sheet: refs go through
+    # a separate encoder and are attended to via cross-attention).
+    ref_mode: str = "none"
+    n_ref: int = 8       # number of reference chunks per row
+    ref_len: int = 256   # tokens per reference chunk
+    n_enc_layer: int = 0 # encoder depth (ref_mode="encoder" only)
+    cross_every: int = 1 # add cross-attention every Nth decoder layer (ref_mode="encoder" only)
 
 
 def norm(x):
@@ -65,9 +73,10 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, causal=True):
         super().__init__()
         self.layer_idx = layer_idx
+        self.causal = causal
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
@@ -79,7 +88,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
-        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if (causal and has_ve(layer_idx, config.n_layer)) else None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -106,10 +115,11 @@ class CausalSelfAttention(nn.Module):
         # Flash Attention (FA3 or SDPA fallback)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            # Training: causal (or, for the encoder, non-causal) attention with optional sliding window
+            y = flash_attn.flash_attn_func(q, k, v, causal=self.causal, window_size=window_size)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
+            assert self.causal, "KV cache is not supported for non-causal (encoder) attention"
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
             y = flash_attn.flash_attn_with_kvcache(
                 q, k_cache, v_cache,
@@ -123,6 +133,44 @@ class CausalSelfAttention(nn.Module):
                 kv_cache.advance(T)
 
         # Re-assemble the heads and project back to residual stream
+        y = y.contiguous().view(B, T, -1)
+        y = self.c_proj(y)
+        return y
+
+
+class CrossAttention(nn.Module):
+    """Decoder-side cross-attention into encoded reference memory (ref_mode='encoder' only).
+    No RoPE (references aren't positioned relative to the decoder stream) and no causal mask
+    (seeing the whole reference is the point of a "cheat sheet")."""
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+
+    def forward(self, x, mem, kv_cache):
+        B, T, C = x.size()
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        q = norm(q) * 1.2
+        # Cross-attn keys/values only depend on the (fixed) references, so with a KV cache
+        # they're projected once at prefill and reused for every subsequent decode step.
+        cached = kv_cache.cross_kv.get(self.layer_idx) if kv_cache is not None else None
+        if cached is not None:
+            k, v = cached
+        else:
+            Tm = mem.size(1)
+            k = self.c_k(mem).view(B, Tm, self.n_kv_head, self.head_dim)
+            v = self.c_v(mem).view(B, Tm, self.n_kv_head, self.head_dim)
+            k = norm(k) * 1.2
+            if kv_cache is not None:
+                kv_cache.cross_kv[self.layer_idx] = (k, v)
+        y = flash_attn.flash_attn_func(q, k, v, causal=False)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -142,13 +190,16 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, encoder=False, cross_attn=False):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.attn = CausalSelfAttention(config, layer_idx, causal=not encoder)
+        self.cross_attn = CrossAttention(config, layer_idx) if cross_attn else None
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, mem=None):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+        if self.cross_attn is not None:
+            x = x + self.cross_attn(norm(x), mem, kv_cache)
         x = x + self.mlp(norm(x))
         return x
 
@@ -172,8 +223,13 @@ class GPT(nn.Module):
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "h": nn.ModuleList([
+                Block(config, layer_idx, cross_attn=(config.ref_mode == "encoder" and layer_idx % config.cross_every == 0))
+                for layer_idx in range(config.n_layer)
+            ]),
         })
+        # Encoder for reference chunks (ref_mode="encoder" only, empty otherwise). Shares wte with the decoder.
+        self.encoder = nn.ModuleList([Block(config, layer_idx, encoder=True) for layer_idx in range(config.n_enc_layer)])
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
@@ -223,13 +279,18 @@ class GPT(nn.Module):
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
-        for block in self.transformer.h:
+        for block in list(self.transformer.h) + list(self.encoder):
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if block.cross_attn is not None:
+                torch.nn.init.uniform_(block.cross_attn.c_q.weight, -s, s)
+                torch.nn.init.uniform_(block.cross_attn.c_k.weight, -s, s)
+                torch.nn.init.uniform_(block.cross_attn.c_v.weight, -s, s)
+                torch.nn.init.zeros_(block.cross_attn.c_proj.weight) # zero-init: cheat_sheet starts ignoring refs
 
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
@@ -297,9 +358,11 @@ class GPT(nn.Module):
         """
         pattern = config.window_pattern.upper()
         assert all(c in "SL" for c in pattern), f"Invalid window_pattern: {pattern}. Use only S and L."
-        # Map characters to window sizes
-        long_window = config.sequence_len
-        short_window = -(-long_window // 4 // 128) * 128  # ceil to FA3 tile size (2048 -> 768)
+        # Map characters to window sizes. In "prefix" mode the decoder actually sees the
+        # references concatenated before idx, so the full context is longer than sequence_len.
+        # The short window stays tied to sequence_len so S layers match the plain decoder.
+        long_window = config.sequence_len + (config.n_ref * config.ref_len if config.ref_mode == "prefix" else 0)
+        short_window = -(-config.sequence_len // 4 // 128) * 128  # ceil to FA3 tile size (2048 -> 768)
         char_to_window = {
             "L": (long_window, 0),
             "S": (short_window, 0),
@@ -329,13 +392,43 @@ class GPT(nn.Module):
         - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
         """
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        # Sum attention FLOPs per layer, accounting for sliding window
-        attn_flops = 0
-        for window_size in self.window_sizes:
-            window = window_size[0]  # (left, right) tuple, we use left
-            effective_seq = t if window < 0 else min(window, t)
-            attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * self.num_matmul_params() + attn_flops
+        ref_mode = self.config.ref_mode
+
+        def attn_flops_over(window_sizes, seq_len):
+            # Sum attention FLOPs per layer (over `seq_len` tokens each), accounting for sliding window
+            total = 0
+            for window_size in window_sizes:
+                window = window_size[0]  # (left, right) tuple, we use left
+                effective_seq = seq_len if window < 0 else min(window, seq_len)
+                total += 12 * h * q * effective_seq
+            return total
+
+        if ref_mode == "none":
+            num_flops_per_token = 6 * self.num_matmul_params() + attn_flops_over(self.window_sizes, t)
+        elif ref_mode == "prefix":
+            # References are concatenated as a prefix of length P; the whole (t+P)-token
+            # sequence runs through the body, but only the t doc tokens are predicted
+            # (lm_head only runs on those, since forward() slices before the lm_head).
+            P = self.config.n_ref * self.config.ref_len
+            total_len = t + P
+            lm_head_params = self.lm_head.weight.numel()
+            body_params = self.num_matmul_params() - lm_head_params
+            attn_flops = attn_flops_over(self.window_sizes, total_len) * (total_len / t)
+            num_flops_per_token = 6 * body_params * (total_len / t) + 6 * lm_head_params + attn_flops
+        elif ref_mode == "encoder":
+            # References are encoded once per row (P tokens through n_enc_layer layers, plus the
+            # cross-attention k/v projections) and amortized over the t predicted doc tokens.
+            # Everything else (decoder self-attn + mlp, cross-attn q/proj) runs per doc token as usual.
+            P = self.config.n_ref * self.config.ref_len
+            lm_head_params = self.lm_head.weight.numel()
+            ref_params, cross_layers = self._ref_encoding_params()
+            decoder_params = self.num_matmul_params() - lm_head_params - ref_params
+            attn_flops = attn_flops_over(self.window_sizes, t)  # decoder self-attn, over doc tokens only
+            attn_flops += 12 * h * q * P * cross_layers  # cross-attn: t queries each attend P memory tokens
+            attn_flops += 12 * h * q * self.config.ref_len * len(self.encoder) * (P / t)  # encoder self-attn, amortized
+            num_flops_per_token = 6 * decoder_params + 6 * lm_head_params + 6 * ref_params * (P / t) + attn_flops
+        else:
+            raise ValueError(f"Unknown ref_mode: {ref_mode}")
         return num_flops_per_token
 
     def num_matmul_params(self):
@@ -348,27 +441,48 @@ class GPT(nn.Module):
         matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear))
         return matmul_params
 
+    def _ref_encoding_params(self):
+        """ref_mode="encoder": matmul params that only see the P reference tokens (encoder +
+        cross-attn k/v projections), i.e. run once per row, not per doc token. Also returns
+        the number of cross-attention layers. Both are 0 for the other modes."""
+        cross_blocks = [b for b in self.transformer.h if b.cross_attn is not None]
+        encoder_params = sum(p.numel() for p in self.encoder.parameters())
+        cross_kv_params = sum(b.cross_attn.c_k.weight.numel() + b.cross_attn.c_v.weight.numel() for b in cross_blocks)
+        return encoder_params + cross_kv_params, len(cross_blocks)
+
     def estimate_decode_flops(self, context_len):
         """
         Forward FLOPs to decode one token at a given context length during inference:
         2 FLOPs per matmul param, plus attention over min(context, window) per layer.
+        In "prefix" mode context_len counts the reference prefix too (it lives in the KV cache).
+        In "encoder" mode the encoded refs are cached at prefill, so a decode step only pays
+        for cross-attention over the P memory tokens.
         """
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
+        ref_params, cross_layers = self._ref_encoding_params()
+        P = self.config.n_ref * self.config.ref_len
         attn_flops = sum(4 * h * q * min(context_len, window) for window, _ in self.window_sizes)
-        decode_flops = 2 * self.num_matmul_params() + attn_flops
+        attn_flops += 4 * h * q * P * cross_layers
+        decode_flops = 2 * (self.num_matmul_params() - ref_params) + attn_flops
         return decode_flops
 
     def estimate_prefill_flops(self, num_tokens):
-        """Forward FLOPs to prefill a prompt: causal, so token t attends to min(t, window)."""
+        """Forward FLOPs to prefill a prompt: causal, so token t attends to min(t, window).
+        In "prefix" mode num_tokens counts the reference prefix too. In "encoder" mode this
+        adds the one-time cost of encoding the P reference tokens and cross-attending to them."""
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
+        ref_params, cross_layers = self._ref_encoding_params()
+        P = self.config.n_ref * self.config.ref_len
         attn_flops = 0
         for window, _ in self.window_sizes:
             w = min(window, num_tokens)
             attended_tokens = w * (w + 1) // 2 + (num_tokens - w) * w # ramp up to w, then flat
             attn_flops += 4 * h * q * attended_tokens
-        prefill_flops = 2 * self.num_matmul_params() * num_tokens + attn_flops
+        attn_flops += 4 * h * q * P * cross_layers * num_tokens  # cross-attn
+        attn_flops += 4 * h * q * self.config.ref_len * len(self.encoder) * P  # encoder self-attn (non-causal)
+        prefill_flops = 2 * (self.num_matmul_params() - ref_params) * num_tokens + 2 * ref_params * P + attn_flops
         return prefill_flops
 
     def kv_bytes_per_token(self):
@@ -404,14 +518,16 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
+        encoder = sum(p.numel() for p in self.encoder.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        total = wte + value_embeds + lm_head + transformer_matrices + encoder + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
+            'encoder': encoder,
             'scalars': scalars,
             'total': total,
         }
@@ -420,7 +536,8 @@ class GPT(nn.Module):
         model_dim = self.config.n_embd
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        # (cross-attention params live inside transformer.h's blocks, so no separate group needed)
+        matrix_params = list(self.transformer.h.parameters()) + list(self.encoder.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -456,7 +573,34 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def encode(self, refs):
+        """FiD-style: encode each reference chunk independently (no cross-chunk attention).
+        refs: (B, n_ref, ref_len) token ids -> mem: (B, n_ref*ref_len, n_embd)."""
+        B, R, L = refs.shape
+        z = self.transformer.wte(refs.view(B * R, L))
+        z = norm(z.to(COMPUTE_DTYPE))
+        cos_sin = self.cos[:, :L], self.sin[:, :L]
+        for block in self.encoder:
+            z = block(z, None, cos_sin, (-1, -1), None)
+        z = norm(z)
+        return z.view(B, R * L, -1)
+
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', refs=None):
+        ref_mode = self.config.ref_mode
+        assert refs is not None or ref_mode == "none" or (kv_cache is not None and kv_cache.get_pos() > 0), \
+            f"refs are required for ref_mode={ref_mode!r} (except decode steps after a prefill that already saw them)"
+
+        # Reference handling: "prefix" concatenates refs before idx (baseline, loss only on idx);
+        # "encoder" runs refs through a separate encoder, attended to via cross-attention (cheat_sheet).
+        mem = None
+        P = 0
+        if ref_mode == "prefix" and refs is not None:
+            B_refs, n_ref, ref_len = refs.shape
+            P = n_ref * ref_len
+            idx = torch.cat([refs.view(B_refs, P), idx], dim=1)
+        elif ref_mode == "encoder" and refs is not None:
+            mem = self.encode(refs)
+
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -499,13 +643,17 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, mem=mem)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
         x = norm(x)
+
+        # In "prefix" mode, only the doc tokens (not the reference prefix) are predicted
+        if P > 0:
+            x = x[:, P:]
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
