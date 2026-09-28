@@ -68,13 +68,18 @@ arm_args() {
     esac
 }
 
-# Per-GPU micro-batch (rows) for a 24GB 4090. First guesses, not measured yet: both arms push about twice
-# the tokens of a plain decoder through their layers (the baseline's 4096-token sequence; cheat_sheet's
-# 2048 decoder + 2048 encoder tokens), and the old plain d24 run fit 2 rows with --fp8. Gradient
-# accumulation makes up the difference to TOTAL_BATCH_SIZE, so this only changes speed, never the result.
-# Override with DEVICE_BATCH_SIZE=N if a run OOMs. runs/smoke.sh with SMOKE_DEPTH=N is a cheap way to probe.
+# Per-GPU micro-batch (rows) for a 24GB 4090. Gradient accumulation makes up the difference to
+# TOTAL_BATCH_SIZE, so this only changes speed, never the result. Override with DEVICE_BATCH_SIZE=N if a
+# run OOMs anyway (e.g. another process is sharing the GPU).
+#
+# Measured with runs/smoke.sh at the real total batch size, --fp8, 30 steps + evals + resume (2026-09-28):
+# baseline d24 b1 peaks at 18.8GiB, b2 OOMs; cheat_sheet d20 b1 peaks at 17.6GiB, d22 OOMs even at b1. The
+# smaller depths are unmeasured guesses. Note that short probes (1 micro-step, no eval) read about 3GiB low.
+# cheat_sheet's encoder + cross-attention make it use about as much memory as a baseline 4 layers deeper
+# (which is also about where their scaling params match: cheat_sheet d20 763M vs baseline d24 730M).
 device_batch_size() {
-    local depth=$2
+    local arm=$1 depth=$2
+    [ "$arm" = cheat_sheet ] && depth=$((depth + 4))
     if [ -n "$DEVICE_BATCH_SIZE" ]; then echo "$DEVICE_BATCH_SIZE"
     elif [ "$depth" -le 12 ]; then echo 8
     elif [ "$depth" -le 16 ]; then echo 4

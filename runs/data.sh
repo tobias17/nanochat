@@ -73,6 +73,16 @@ pack_split() {
     python -m nanochat.pack --split "$split" --world-size "$NPROC"
 }
 
+# search-shard runs one process per GPU (each resident on its own contiguous slice of the wiki index,
+# so the GPU work is fully parallel); search-merge then combines the per-GPU shards into the final
+# per-window candidates. Splitting the stage this way is what makes it parallel instead of the previous
+# single-process version, which held the whole index but visited its GPU shards one at a time.
+search_split() {
+    local split=$1
+    per_gpu python -m scripts.wiki_retrieve search-shard --split "$split" || return 1
+    python -m scripts.wiki_retrieve search-merge --split "$split" --world-size "$NPROC"
+}
+
 # -----------------------------------------------------------------------------
 
 if want setup; then
@@ -114,7 +124,7 @@ if want search; then
         need "$WIKI_DIR/.embed.done"
         need "$PACK_DIR/.${split}_qemb.done"
         [ -f "$PACK_DIR/.${split}_search.done" ] || require_free_gpus
-        stage "$PACK_DIR/.${split}_search.done" python -m scripts.wiki_retrieve search --split "$split" --gpus $(seq 0 $((NPROC - 1)))
+        stage "$PACK_DIR/.${split}_search.done" search_split "$split"
     done
 fi
 

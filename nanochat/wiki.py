@@ -304,7 +304,7 @@ def embed(batch_size=256, dtype="fp16", rank=0, world_size=6, gpu=None, wiki_dir
 # the matmul, so peak memory per GPU is (resident shard) + (one block in fp16).
 
 class WikiIndex:
-    def __init__(self, dtype="fp16", gpus=None, block_size=1_000_000, wiki_dir=None):
+    def __init__(self, dtype="fp16", gpus=None, block_size=200_000, wiki_dir=None):
         assert dtype in ("fp16", "int8")
         self.dtype = dtype
         self.block_size = block_size

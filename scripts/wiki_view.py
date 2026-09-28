@@ -101,7 +101,8 @@ class RowViewer:
         assert os.path.exists(ref_ids_path), (
             f"No reference ids for split={split!r} at {ref_ids_path}. Run the wiki_retrieve pipeline first:\n"
             f"  python -m scripts.wiki_retrieve embed-windows --split {split}\n"
-            f"  python -m scripts.wiki_retrieve search --split {split}\n"
+            f"  python -m scripts.wiki_retrieve search-shard --split {split}\n"
+            f"  python -m scripts.wiki_retrieve search-merge --split {split}\n"
             f"  python -m scripts.wiki_retrieve dedup --split {split}"
         )
         self.ref_ids = np.load(ref_ids_path)

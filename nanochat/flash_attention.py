@@ -30,17 +30,16 @@ def _load_flash_attention_3():
         # Blackwell (sm100) needs SDPA fallback until FA3 is recompiled or FA4 is released
         import os
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-        from kernels import get_kernel, has_kernel
+        from kernels import get_kernel
         # The varunneal kernel obtains better results for H100/Hopper
+        # get_kernel() alone (no has_kernel() pre-check) so this works under HF_HUB_OFFLINE=1: has_kernel()
+        # does an unconditional network existence check that raises OfflineModeIsEnabled even when the
+        # kernel is fully cached locally, which the except below would otherwise mistake for "unavailable".
         if major == 9:
             hf_kernel = "varunneal/flash-attention-3"
-            return get_kernel(hf_kernel).flash_attn_interface
         else:
             hf_kernel = "kernels-community/flash-attn3"
-            if has_kernel(hf_kernel):
-                return get_kernel(hf_kernel).flash_attn_interface
-            else:
-                return None
+        return get_kernel(hf_kernel).flash_attn_interface
 
     except Exception:
         return None

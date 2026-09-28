@@ -8,13 +8,14 @@
 #   bash runs/smoke.sh
 #   SMOKE_DEPTH=20 bash runs/smoke.sh                        # does the default device batch size fit at d20?
 #   SMOKE_DEPTH=20 DEVICE_BATCH_SIZE=4 bash runs/smoke.sh    # ... or does 4?
+#   SMOKE_DEPTH_baseline=24 SMOKE_DEPTH_cheat_sheet=20 FP8=1 bash runs/smoke.sh   # the full-run configs
 #
 # Checkpoints: base_checkpoints/smoke_<arm>_d<depth>, logs: $NANOCHAT_BASE_DIR/experiments/smoke/
 
 source "$(dirname "$0")/common.sh"
 
-DEPTH="${SMOKE_DEPTH:-4}"
 STEPS="${SMOKE_STEPS:-20}"
+FP8_ARG=$([ "${FP8:-0}" = 1 ] && echo --fp8)
 ARMS=(${ARMS:-baseline cheat_sheet})
 OUT_DIR="$EXPERIMENTS_DIR/smoke"
 mkdir -p "$OUT_DIR"
@@ -24,6 +25,8 @@ require_free_gpus
 
 for arm in "${ARMS[@]}"; do
     check_arm "$arm"
+    depth_var="SMOKE_DEPTH_${arm}"
+    DEPTH="${!depth_var:-${SMOKE_DEPTH:-4}}"
     TAG="smoke_${arm}_d${DEPTH}"
     DBS=$(device_batch_size "$arm" "$DEPTH")
     LOG="$OUT_DIR/${TAG}.log"
@@ -31,7 +34,7 @@ for arm in "${ARMS[@]}"; do
     log "Smoke test: $arm d$DEPTH, device batch size $DBS (log: $LOG)"
 
     TRAIN_ARGS=(
-        "${COMMON_TRAIN_ARGS[@]}" $(arm_args "$arm")
+        "${COMMON_TRAIN_ARGS[@]}" $(arm_args "$arm") $FP8_ARG
         --depth="$DEPTH"
         --device-batch-size="$DBS"
         --num-iterations="$STEPS"
