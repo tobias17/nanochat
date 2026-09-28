@@ -32,7 +32,7 @@ from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir,
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
-from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
+from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, packed_data_loader
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 
@@ -152,6 +152,12 @@ def main():
     token_bytes = get_token_bytes(device=device)
     model_name = f"base_model (step {meta['step']})"
     model_slug = f"base_model_{meta['step']:06d}"
+    # Reference models ("cheat sheet" experiment) need refs for every forward pass. Only bpb on the
+    # pre-packed rows has them so far; CORE and sampling would need retrieval at eval time.
+    ref_mode = meta["model_config"].get("ref_mode", "none")
+    if ref_mode != "none" and eval_modes & {'core', 'sample'}:
+        print0(f"WARNING: core and sample evals are not supported yet for ref_mode={ref_mode}, skipping them")
+        eval_modes -= {'core', 'sample'}
 
     print0(f"Evaluating model: {model_name}")
     print0(f"Eval modes: {', '.join(sorted(eval_modes))}")
@@ -209,7 +215,10 @@ def main():
         steps = args.split_tokens // tokens_per_step
 
         for split_name in ["train", "val"]:
-            loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, sequence_len, split_name, device=device)
+            if ref_mode == "none":
+                loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, sequence_len, split_name, device=device)
+            else:
+                loader = packed_data_loader(args.device_batch_size, sequence_len, split_name, device=device)
             bpb = evaluate_bpb(model, loader, steps, token_bytes)
             bpb_results[split_name] = bpb
             print0(f"{split_name} bpb: {bpb:.6f}")

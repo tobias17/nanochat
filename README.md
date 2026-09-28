@@ -165,10 +165,11 @@ I've published a number of guides that might contain helpful information, most r
 │   └── tokenizer.py                # BPE Tokenizer wrapper in style of GPT-4
 ├── pyproject.toml
 ├── runs
-│   ├── miniseries.sh               # Miniseries training script
-│   ├── runcpu.sh                   # Small example of how to run on CPU/MPS
-│   ├── scaling_laws.sh             # Scaling laws experiments
-│   └── speedrun.sh                 # Train the ~$100 nanochat d20
+│   ├── common.sh                   # Shared settings/helpers for the reference ("cheat sheet") experiment
+│   ├── data.sh                     # Build packed rows + retrieved Wikipedia refs
+│   ├── smoke.sh                    # Tiny end-to-end check of both arms
+│   ├── isoflop.sh                  # IsoFLOP sweep: baseline vs cheat_sheet
+│   └── train.sh                    # Headline run of one arm
 ├── scripts
 │   ├── base_eval.py                # Base model: CORE score, bits per byte, samples
 │   ├── base_train.py               # Base model: train

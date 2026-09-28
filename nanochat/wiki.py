@@ -252,15 +252,24 @@ def embed_rows_to_memmap(row_ids_fn, n, out_path, model, tokenizer, batch_size=2
     )
 
     t0 = time.time()
+    n_resumed = 0
     for bstart in range(start, end, batch_size):
         bend = min(bstart + batch_size, end)
+        if emb[bend - 1].any():
+            # Resume: each rank writes its shard front to back, and a unit-norm embedding is never all
+            # zeros, so a nonzero last row means an earlier (interrupted) run already did this batch.
+            # (Only valid if that run used the same world_size, i.e. the same shard boundaries.)
+            n_resumed += bend - bstart
+            continue
         id_lists = [row_ids_fn(i) for i in range(bstart, bend)]
         emb[bstart:bend] = embed_id_lists(id_lists, tokenizer, model, dtype)
         done, total = bend - start, end - start
         if (bstart // batch_size) % 20 == 0 or bend == end:
-            rate = done / max(time.time() - t0, 1e-6)
+            rate = (done - n_resumed) / max(time.time() - t0, 1e-6)
             eta = (total - done) / max(rate, 1e-6)
             print(f"{log_prefix}rank {rank}: {done}/{total} rows ({rate:.0f}/s, eta {eta / 60:.1f}m)")
+    if n_resumed:
+        print(f"{log_prefix}rank {rank}: skipped {n_resumed} rows already embedded by an earlier run")
     emb.flush()
     return start, end
 

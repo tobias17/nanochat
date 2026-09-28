@@ -179,3 +179,66 @@ def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
     """Helper that omits state_dict from yields."""
     for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
         yield inputs, targets
+
+# -----------------------------------------------------------------------------
+# Pre-packed rows (reference/"cheat sheet" experiment)
+
+def packed_data_loader_with_state(B, T, split, device="cuda", resume_state_dict=None):
+    """
+    Dataloader over the offline pre-packed rows of nanochat/pack.py, whose wiki reference
+    columns were filled in by scripts/wiki_retrieve.py. Yields (inputs, targets, refs, state_dict)
+    where inputs/targets are (B, T) and refs are (B, n_ref, ref_len).
+
+    pack.py interleaves its streams so that file row i*world_size+r is stream r's i-th row,
+    so rank r simply walks its own stream in order. The set of rows an optimizer step sees
+    therefore depends only on the world size and total batch size, never on device_batch_size,
+    which is what lets two arms with different memory footprints train on identical data.
+    Resume is exact: state_dict is the stream position of the batch being yielded.
+    """
+    import numpy as np
+    from nanochat.pack import packed_path, DOC_WIDTH, NUM_WINDOWS, WINDOW_LEN # (lazy: nanochat.pack imports this module)
+    assert split in ["train", "val"], "split must be 'train' or 'val'"
+    assert T + 1 == DOC_WIDTH, f"packed rows hold {DOC_WIDTH} doc tokens, so T must be {DOC_WIDTH - 1} (got {T})"
+
+    _, rank, _, world_size = get_dist_info()
+    rows = np.load(packed_path(split), mmap_mode="r")
+    stream_len = rows.shape[0] // world_size
+    assert stream_len >= B, f"{packed_path(split)} has only {stream_len} rows per rank, need at least {B}"
+    pos = resume_state_dict["pos"] if resume_state_dict is not None else 0
+    epoch = resume_state_dict["epoch"] if resume_state_dict is not None else 1
+
+    # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T) | refs (B*P)]
+    P = NUM_WINDOWS * WINDOW_LEN
+    use_cuda = device == "cuda"
+    cpu_buffer = torch.empty(2 * B * T + B * P, dtype=torch.long, pin_memory=use_cuda)
+    gpu_buffer = torch.empty(2 * B * T + B * P, dtype=torch.long, device=device)
+    cpu_inputs = cpu_buffer[:B * T].view(B, T)
+    cpu_targets = cpu_buffer[B * T:2 * B * T].view(B, T)
+    cpu_refs = cpu_buffer[2 * B * T:].view(B, P)
+    inputs = gpu_buffer[:B * T].view(B, T)
+    targets = gpu_buffer[B * T:2 * B * T].view(B, T)
+    refs = gpu_buffer[2 * B * T:].view(B, NUM_WINDOWS, WINDOW_LEN)
+
+    copy_done = None
+    while True:
+        if pos + B > stream_len:
+            pos, epoch = 0, epoch + 1 # wrap around (drops the stream's last partial batch)
+        state_dict = {"pos": pos, "epoch": epoch}
+        batch = torch.from_numpy(rows[pos * world_size + rank:(pos + B) * world_size:world_size].astype(np.int64))
+        # don't overwrite the pinned staging buffer while the previous HtoD copy may still be reading it
+        if copy_done is not None:
+            copy_done.synchronize()
+        cpu_inputs.copy_(batch[:, :T])
+        cpu_targets.copy_(batch[:, 1:DOC_WIDTH])
+        cpu_refs.copy_(batch[:, DOC_WIDTH:])
+        gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
+        if use_cuda:
+            copy_done = torch.cuda.Event()
+            copy_done.record()
+        pos += B
+        yield inputs, targets, refs, state_dict
+
+def packed_data_loader(*args, **kwargs):
+    """Helper that omits state_dict from yields."""
+    for inputs, targets, refs, state_dict in packed_data_loader_with_state(*args, **kwargs):
+        yield inputs, targets, refs

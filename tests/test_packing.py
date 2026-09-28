@@ -1,7 +1,8 @@
 """
 Tests for offline row packing (nanochat.dataloader.BestFitPacker, shared by the live
 training loader and nanochat.pack), wiki chunking (nanochat.wiki.split_list_with_overlap),
-and retrieval dedup (scripts.wiki_retrieve.dedup_row).
+retrieval dedup (scripts.wiki_retrieve.dedup_row), the packed-row training loader
+(nanochat.dataloader.packed_data_loader_with_state) and embedding resume (nanochat.wiki).
 
 Hermetic: trains a tiny throwaway tokenizer in-process, no dependency on ~/.cache/nanochat.
 
@@ -9,10 +10,13 @@ python -m pytest tests/test_packing.py -v
 """
 import numpy as np
 import pytest
+import torch
 
 from nanochat.tokenizer import RustBPETokenizer, SPECIAL_TOKENS
-from nanochat.dataloader import BestFitPacker
-from nanochat.wiki import split_list_with_overlap
+import nanochat.pack
+from nanochat.pack import DOC_WIDTH, ROW_WIDTH, NUM_WINDOWS, WINDOW_LEN
+from nanochat.dataloader import BestFitPacker, packed_data_loader_with_state
+from nanochat.wiki import split_list_with_overlap, embed_rows_to_memmap
 from scripts.wiki_retrieve import dedup_row, ARTICLE_K
 
 CORPUS = [
@@ -126,3 +130,103 @@ def test_dedup_row_no_duplicate_articles_with_heavy_overlap():
     assert all(c >= 0 for c in chunk)  # never runs out of candidates in this regime
     assigned_articles = [chunk_article[c] for c in chunk]
     assert len(assigned_articles) == len(set(assigned_articles))
+
+# -----------------------------------------------------------------------------
+# packed-row training loader
+
+WORLD_SIZE = 3
+STREAM_LEN = 10
+
+@pytest.fixture
+def packed_rows(tmp_path, monkeypatch):
+    """ A fake packed file laid out like nanochat.pack writes it: file row i*WORLD_SIZE+r is stream r's i-th row.
+    Every token of a row is its file row index (+1 in the ref columns, to tell them apart from the doc). """
+    rows = np.repeat(np.arange(STREAM_LEN * WORLD_SIZE, dtype=np.uint16)[:, None], ROW_WIDTH, axis=1)
+    rows[:, DOC_WIDTH:] += 1
+    path = tmp_path / "train.npy"
+    np.save(path, rows)
+    monkeypatch.setattr(nanochat.pack, "packed_path", lambda split: str(path))
+    return rows
+
+def _load(monkeypatch, rank, B, n_batches, resume_state_dict=None):
+    monkeypatch.setenv("RANK", str(rank))
+    monkeypatch.setenv("LOCAL_RANK", str(rank))
+    monkeypatch.setenv("WORLD_SIZE", str(WORLD_SIZE))
+    loader = packed_data_loader_with_state(B, DOC_WIDTH - 1, "train", device="cpu", resume_state_dict=resume_state_dict)
+    out = []
+    for _ in range(n_batches):
+        x, y, refs, state = next(loader)
+        out.append((x.clone(), y.clone(), refs.clone(), state))
+    return out
+
+def test_packed_loader_walks_own_stream_in_order(packed_rows, monkeypatch):
+    B = 2
+    for rank in range(WORLD_SIZE):
+        batches = _load(monkeypatch, rank, B, n_batches=3)
+        file_rows = torch.cat([x[:, 0] for x, _, _, _ in batches]).tolist()
+        assert file_rows == [i * WORLD_SIZE + rank for i in range(3 * B)]
+        x, y, refs, state = batches[0]
+        assert x.shape == (B, DOC_WIDTH - 1) and y.shape == (B, DOC_WIDTH - 1)
+        assert refs.shape == (B, NUM_WINDOWS, WINDOW_LEN)
+        assert torch.equal(refs[:, 0, 0], x[:, 0] + 1)  # refs come from the same row as the doc
+
+def test_packed_loader_targets_are_inputs_shifted(packed_rows, monkeypatch):
+    rows = packed_rows.astype(np.int64)
+    rows[:, :DOC_WIDTH] = np.arange(DOC_WIDTH)  # distinct tokens along the doc, to check the shift
+    np.save(nanochat.pack.packed_path("train"), rows.astype(np.uint16))
+    x, y, _, _ = _load(monkeypatch, 0, B=2, n_batches=1)[0]
+    assert torch.equal(x[:, 1:], y[:, :-1])
+    assert y[0, -1].item() == DOC_WIDTH - 1
+
+def test_packed_loader_rows_per_step_independent_of_device_batch_size(packed_rows, monkeypatch):
+    # one optimizer step of 4 rows per rank: 1 micro-batch of 4 or 2 micro-batches of 2 see the same rows
+    big = _load(monkeypatch, 1, B=4, n_batches=1)
+    small = _load(monkeypatch, 1, B=2, n_batches=2)
+    assert big[0][0][:, 0].tolist() == torch.cat([x[:, 0] for x, _, _, _ in small]).tolist()
+
+def test_packed_loader_resume_is_exact(packed_rows, monkeypatch):
+    full = _load(monkeypatch, 2, B=3, n_batches=4)
+    resumed = _load(monkeypatch, 2, B=3, n_batches=2, resume_state_dict=full[2][3])
+    assert [x[:, 0].tolist() for x, _, _, _ in resumed] == [x[:, 0].tolist() for x, _, _, _ in full[2:]]
+
+def test_packed_loader_wraps_to_next_epoch(packed_rows, monkeypatch):
+    B = 3  # STREAM_LEN=10 rows per rank: 3 full batches, then the partial 4th is dropped and it wraps
+    batches = _load(monkeypatch, 0, B, n_batches=4)
+    assert [s["epoch"] for _, _, _, s in batches] == [1, 1, 1, 2]
+    assert batches[3][0][:, 0].tolist() == batches[0][0][:, 0].tolist()
+
+# -----------------------------------------------------------------------------
+# embedding resume
+
+class _FakeEmbedder:
+    """ Stands in for the SentenceTransformer: embeds a text as a one-hot of its length, counting calls. """
+    dim = 8
+    def __init__(self):
+        self.n_encoded = 0
+    def get_sentence_embedding_dimension(self):
+        return self.dim
+    def encode(self, texts, normalize_embeddings=True, show_progress_bar=False):
+        self.n_encoded += len(texts)
+        return np.eye(self.dim, dtype=np.float32)[[len(t) % self.dim for t in texts]]
+
+class _FakeTokenizer:
+    def decode(self, ids):
+        return "x" * len(ids)
+
+def test_embed_rows_resumes_after_interruption(tmp_path):
+    n, batch_size = 40, 8
+    out_path = str(tmp_path / "emb.npy")
+    row_ids_fn = lambda i: [0] * (i % 5 + 1)
+    complete = _FakeEmbedder()
+    embed_rows_to_memmap(row_ids_fn, n, str(tmp_path / "ref.npy"), complete, _FakeTokenizer(), batch_size=batch_size)
+    expected = np.load(tmp_path / "ref.npy")
+
+    # simulate a run that crashed after writing its first 3 batches, then rerun: only the remaining rows get embedded
+    partial = np.lib.format.open_memmap(out_path, mode="w+", dtype=np.float16, shape=(n, _FakeEmbedder.dim))
+    partial[:3 * batch_size] = expected[:3 * batch_size]
+    partial.flush()
+    del partial
+    rerun = _FakeEmbedder()
+    embed_rows_to_memmap(row_ids_fn, n, out_path, rerun, _FakeTokenizer(), batch_size=batch_size)
+    assert rerun.n_encoded == n - 3 * batch_size
+    assert np.array_equal(np.load(out_path), expected)
