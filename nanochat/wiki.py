@@ -108,6 +108,11 @@ def build(max_articles=-1, chunk_len=256, overlap=32, clean=True, prepend_title=
     meta_parts = []     # per-file (n, 2) int32 arrays of (article_row, chunk_idx_within_article)
     all_titles, all_urls = [], []
 
+    # total row count across all files, for a percent/ETA against the whole corpus (cheap: metadata only, no data read)
+    total_rows = sum(pq.read_metadata(p).num_rows for p in files)
+    if max_articles >= 0:
+        total_rows = min(total_rows, max_articles)
+
     max_title_len = chunk_len // 2  # a (pathologically) long title never takes more than half a chunk
     assert overlap < chunk_len - max_title_len
     article_row = 0
@@ -115,17 +120,32 @@ def build(max_articles=-1, chunk_len=256, overlap=32, clean=True, prepend_title=
     t0 = time.time()
     with open(raw_path, "wb") as tf:
         for fi, path in enumerate(files):
+            tf0 = time.time()
             table = pq.read_table(path, columns=["title", "url", "text"])
             if max_articles >= 0:
                 table = table.slice(0, max_articles - article_row)
+            n_rows = table.num_rows
+            print(f"[{fi + 1}/{len(files)}] {os.path.basename(path)}: read {n_rows} rows in {time.time() - tf0:.0f}s", flush=True)
+
+            t1 = time.time()
             titles = table.column("title").to_pylist()
             urls = table.column("url").to_pylist()
             texts = table.column("text").to_pylist()
+            print(f"[{fi + 1}/{len(files)}]   to_pylist: {time.time() - t1:.0f}s", flush=True)
 
+            t1 = time.time()
             bodies = [clean_article_text(t) if clean else t for t in texts]
-            body_id_lists = tokenizer.encode(bodies, num_threads=8)
-            title_id_lists = tokenizer.encode([t + "\n\n" for t in titles], num_threads=8) if prepend_title else None
+            print(f"[{fi + 1}/{len(files)}]   clean: {time.time() - t1:.0f}s", flush=True)
 
+            t1 = time.time()
+            body_id_lists = tokenizer.encode(bodies, num_threads=8)
+            print(f"[{fi + 1}/{len(files)}]   encode bodies: {time.time() - t1:.0f}s", flush=True)
+
+            t1 = time.time()
+            title_id_lists = tokenizer.encode([t + "\n\n" for t in titles], num_threads=8) if prepend_title else None
+            print(f"[{fi + 1}/{len(files)}]   encode titles: {time.time() - t1:.0f}s", flush=True)
+
+            t1 = time.time()
             batch_chunks, batch_meta = [], []
             for i, body_ids in enumerate(body_id_lists):
                 if prepend_title:
@@ -141,13 +161,21 @@ def build(max_articles=-1, chunk_len=256, overlap=32, clean=True, prepend_title=
                 article_row += 1
             all_titles.extend(titles)
             all_urls.extend(urls)
+            print(f"[{fi + 1}/{len(files)}]   chunk: {time.time() - t1:.0f}s", flush=True)
 
+            t1 = time.time()
             if batch_chunks:
                 np.asarray(batch_chunks, dtype=np.uint16).tofile(tf)
                 n_chunks += len(batch_chunks)
             meta_parts.append(np.asarray(batch_meta, dtype=np.int32).reshape(-1, 2))
-            print(f"[{fi + 1}/{len(files)}] {os.path.basename(path)}: "
-                  f"{article_row} articles, {n_chunks} chunks so far ({time.time() - t0:.0f}s)")
+            print(f"[{fi + 1}/{len(files)}]   write: {time.time() - t1:.0f}s", flush=True)
+
+            elapsed = time.time() - t0
+            pct = 100 * article_row / max(total_rows, 1)
+            rate = article_row / max(elapsed, 1e-6)
+            eta = (total_rows - article_row) / max(rate, 1e-6)
+            print(f"[{fi + 1}/{len(files)}] done: {article_row}/{total_rows} articles ({pct:.1f}%), "
+                  f"{n_chunks} chunks so far, {elapsed:.0f}s elapsed, ETA {eta / 60:.1f}m", flush=True)
             if article_row == max_articles:
                 break
 
