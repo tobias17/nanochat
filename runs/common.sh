@@ -73,11 +73,14 @@ arm_args() {
 # TOTAL_BATCH_SIZE, so this only changes speed, never the result. Override with DEVICE_BATCH_SIZE=N if a
 # run OOMs anyway (e.g. another process is sharing the GPU).
 #
-# Measured with runs/smoke.sh at the real total batch size, --fp8, 30 steps + evals + resume (2026-09-28):
-# baseline d24 b1 peaks at 18.8GiB, b2 OOMs; cheat_sheet d20 b1 peaks at 17.6GiB, d22 OOMs even at b1. The
-# smaller depths are unmeasured guesses. Note that short probes (1 micro-step, no eval) read about 3GiB low.
-# cheat_sheet's encoder + cross-attention make it use about as much memory as a baseline 4 layers deeper
-# (which is also about where their scaling params match: cheat_sheet d20 763M vs baseline d24 730M).
+# Peak memory in nvidia-smi, measured at the real total batch size (3 steps + a val eval match full runs within
+# 0.3%; a 1 micro-step probe without eval reads about 3GiB low), --fp8 unless noted (2026-09-28):
+#   baseline     d12 b8 17.7GB (bf16), d14 b8 21.7, d16 b4 16.3 (b8 OOMs), d18 b2 13.7, d18 b4 20.1,
+#                d20 b2 17.0, d22 b2 21.6, d24 b1 21.6 (b2 OOMs)
+#   cheat_sheet  d12 b8 19.7GB (bf16), d14 b4 14.6, d16 b2 13.3, d16 b4 18.0, d18 b2 19.0, d20 b1 19.7,
+#                d21 and d22 OOM even at b1
+# The sizes below are safe at every measured point, but conservative at some (e.g. cheat_sheet d16 b4 is
+# about 10% faster than b2). SFT uses the same row shapes and peaked lower than pretraining in the dry run.
 device_batch_size() {
     local arm=$1 depth=$2
     [ "$arm" = cheat_sheet ] && depth=$((depth + 4))

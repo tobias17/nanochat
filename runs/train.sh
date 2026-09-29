@@ -17,7 +17,9 @@
 #             reference arms they need refs retrieved for their prompts at eval time, which isn't wired up yet
 #   sft       chat_sft (one epoch of SmolTalk + MMLU + GSM8K, one conversation per row, each with its 8 wiki refs
 #             precomputed by data.sh task_refs) to chatsft_checkpoints/<tag>, then chat_eval: ChatCORE on
-#             ARC-E/C, MMLU, GSM8K, HumanEval, also with precomputed refs
+#             ARC-E/C, MMLU, GSM8K, HumanEval, also with precomputed refs. Rows stay at the pretraining 2048:
+#             SFT at --max-seq-len=1536 (tried 2026-09-28) was only ~10% faster per step for both arms (the refs
+#             don't shrink), cropped 1.02% vs 0.71% of conversations, and shrinks the saved model's attention window
 #
 # Dry run (the whole pipeline at full size, just short): a small TARGET_FLOPS gives few steps, e.g.
 #   TARGET_FLOPS=3e17 EVAL_EVERY_FLOPS=1e17 SAVE_EVERY=20 SFT_ITERATIONS=20 CHAT_EVAL_MAX_PROBLEMS=48 TAG=dry_baseline_d24 \
