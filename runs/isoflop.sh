@@ -5,7 +5,7 @@
 # per predicted token (the baseline's ref prefix, cheat_sheet's encoder and cross-attention; see
 # GPT.estimate_flops), and every run uses the same batch size on the same rows.
 #
-#   DRY_RUN=1 bash runs/isoflop.sh     # CPU only, no data needed: params, FLOPs/token, steps, tokens and epochs
+#   PLAN=1 bash runs/isoflop.sh        # CPU only, no data needed: params, FLOPs/token, steps, tokens and epochs
 #                                      # of every run in the sweep, to choose depths/budgets before spending GPU time
 #   bash runs/isoflop.sh               # the sweep. Finished runs are skipped, so it can simply be restarted
 #   LABEL=v2 FLOPS_BUDGETS="1e18" DEPTHS_cheat_sheet="10 12" bash runs/isoflop.sh
@@ -13,6 +13,7 @@
 #
 # Results: $NANOCHAT_BASE_DIR/experiments/isoflop_<label>/results.csv, plus one log per run.
 # Checkpoints (final step only): base_checkpoints/isoflop_<label>_<flops>_<arm>_d<depth>
+# Per-step metrics: base_checkpoints/<that tag>/metrics.jsonl, compare runs with python -m scripts.compare_runs <tags...>
 
 source "$(dirname "$0")/common.sh"
 
@@ -20,11 +21,12 @@ LABEL="${LABEL:-sweep1}"
 FLOPS_BUDGETS=(${FLOPS_BUDGETS:-1e18 3e18})
 ARMS=(${ARMS:-baseline cheat_sheet})
 DEPTHS="${DEPTHS:-8 10 12 14}" # per arm overrides: DEPTHS_baseline="...", DEPTHS_cheat_sheet="..."
+EVAL_EVERY_FLOPS="${EVAL_EVERY_FLOPS:-1e17}" # val bpb at the same compute points in every run of every budget
 FP8_ARG=$([ "${FP8:-0}" = 1 ] && echo --fp8) # off by default: at these small widths most matmuls are too small to gain much
 
 OUT_DIR="$EXPERIMENTS_DIR/isoflop_${LABEL}"
 RESULTS_FILE="$OUT_DIR/results.csv"
-if [ "${DRY_RUN:-0}" != 1 ]; then
+if [ "${PLAN:-0}" != 1 ]; then
     require_data
     require_free_gpus
     mkdir -p "$OUT_DIR"
@@ -43,13 +45,14 @@ for flops in "${FLOPS_BUDGETS[@]}"; do
                 "${COMMON_TRAIN_ARGS[@]}" $(arm_args "$arm")
                 --depth="$d"
                 --target-flops="$flops"
+                --eval-every-flops="$EVAL_EVERY_FLOPS"
                 --target-param-data-ratio=-1
                 --model-tag="$TAG"
             )
 
-            if [ "${DRY_RUN:-0}" = 1 ]; then
-                OUT=$(CUDA_VISIBLE_DEVICES= python -m scripts.base_train "${TRAIN_ARGS[@]}" --device-type=cpu --dry-run 2>&1) \
-                    || { echo "$OUT"; die "dry run failed: $TAG"; }
+            if [ "${PLAN:-0}" = 1 ]; then
+                OUT=$(CUDA_VISIBLE_DEVICES= python -m scripts.base_train "${TRAIN_ARGS[@]}" --device-type=cpu --plan 2>&1) \
+                    || { echo "$OUT"; die "plan failed: $TAG"; }
                 printf "%-8s %-12s %5s %14s %14s %12s %8s %16s %s\n" "$flops" "$arm" "$d" \
                     "$(grep "^total " <<< "$OUT" | awk '{print $NF}')" \
                     "$(grep "^encoder " <<< "$OUT" | awk '{print $NF}')" \
@@ -81,7 +84,7 @@ for flops in "${FLOPS_BUDGETS[@]}"; do
     done
 done
 
-if [ "${DRY_RUN:-0}" != 1 ]; then
+if [ "${PLAN:-0}" != 1 ]; then
     log "IsoFLOP sweep complete: $RESULTS_FILE"
     column -t -s',' "$RESULTS_FILE"
 fi

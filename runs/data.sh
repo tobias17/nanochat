@@ -7,9 +7,9 @@
 #   pack           pack ClimbMix into 2049-token rows exactly as the live loader would          CPU, per split
 #   wiki_embed     embed every wiki chunk with mpnet                                            GPU, one process per GPU
 #   embed_windows  embed each packed row's 8 windows of 256 tokens with mpnet                   GPU, per split
-#   search         top distinct-article wiki candidates for every window                        GPU (index sharded), per split
-#   dedup          article-level dedup per row, then fill the rows' 8x256 reference columns     CPU, per split
-#   task_refs      8 distinct-article wiki refs per SFT / eval conversation, on its question    GPU (index on 3, mpnet on 1)
+#   search         top distinct-text wiki candidates for every window                           GPU (index sharded), per split
+#   dedup          no repeated chunk text per row, then fill the rows' 8x256 reference columns  CPU, per split
+#   task_refs      8 distinct-text wiki refs per SFT / eval conversation, on its question       GPU (index on 3, mpnet on 1)
 #
 # Each stage leaves a marker when it completes, so rerunning this script skips finished work and continues where
 # it stopped. The two embed stages also resume mid-way after a crash. Re-packing a split deletes that split's

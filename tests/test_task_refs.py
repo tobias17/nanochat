@@ -1,5 +1,5 @@
 """
-Test the SFT/eval wiki-ref plumbing: distinct-article selection, per-task retrieval queries,
+Test the SFT/eval wiki-ref plumbing: distinct-text selection, per-task retrieval queries,
 and attaching precomputed refs to tasks (all hermetic, no network / GPU / cached datasets).
 
 python -m pytest tests/test_task_refs.py -v
@@ -13,19 +13,26 @@ import pytest
 
 import tasks.common as common
 from tasks.common import Task, TaskMixture, HubDataset, attach_refs, queries_hash
-from nanochat.wiki import top_distinct_articles
+from nanochat.wiki import top_distinct, chunk_content_ids
 
 
-def test_top_distinct_articles():
-    chunk_article = np.array([0, 0, 1, 1, 2, 3, 3, 4])
-    raw_idx = np.array([[1, 0, 3, 2, 5, 4, 6, 7]])          # score-sorted; articles 0,0,1,1,3,2,3,4
+def test_top_distinct():
+    content_ids = np.array([0, 0, 2, 3, 4, 4, 6, 7])       # chunk 1 copies chunk 0, chunk 5 copies chunk 4
+    raw_idx = np.array([[1, 0, 3, 2, 5, 4, 6, 7]])          # score-sorted; texts 0,0,3,2,4,4,6,7
     raw_scores = np.array([[.9, .8, .7, .6, .5, .4, .3, .2]], dtype=np.float32)
-    ids, scores = top_distinct_articles(raw_idx, raw_scores, chunk_article, 4)
-    assert ids.tolist() == [[1, 3, 5, 4]]                     # best chunk of articles 0, 1, 3, 2 in score order
-    assert np.allclose(scores, [[.9, .7, .5, .4]])
-    assert len(set(chunk_article[ids[0]].tolist())) == 4
-    ids, scores = top_distinct_articles(raw_idx, raw_scores, chunk_article, 6)  # only 5 distinct articles exist
-    assert ids[0, 5] == -1 and scores[0, 5] < -1e8
+    ids, scores = top_distinct(raw_idx, raw_scores, content_ids, 4)
+    assert ids.tolist() == [[1, 3, 2, 5]]                     # first chunk of each text, in score order
+    assert np.allclose(scores, [[.9, .7, .6, .5]])
+    ids, scores = top_distinct(raw_idx, raw_scores, content_ids, 7)  # only 6 distinct texts exist
+    assert ids[0, 6] == -1 and scores[0, 6] < -1e8
+
+
+def test_chunk_content_ids(tmp_path):
+    tokens = np.array([[1, 2, 3], [4, 5, 6], [1, 2, 3], [7, 8, 9], [4, 5, 6], [1, 2, 3]], dtype=np.uint16)
+    np.save(tmp_path / "tokens.npy", tokens)
+    want = [0, 1, 0, 3, 1, 0]                                 # smallest chunk id with the same tokens
+    assert chunk_content_ids(str(tmp_path), block=4).tolist() == want  # block < n: exercises block boundaries
+    assert np.load(tmp_path / "content_ids.npy").tolist() == want      # cached
 
 
 def _fake_ds(monkeypatch, module, **columns):
@@ -112,16 +119,13 @@ def test_attach_refs_rejects_stale_refs(tmp_path, monkeypatch):
         attach_refs(ToyTask(n=10))
 
 
-def test_search_merge_matches_old_inline_loop(tmp_path, monkeypatch):
+def test_search_merge_matches_reference_loop(tmp_path, monkeypatch):
     import scripts.wiki_retrieve as wr
     rng = np.random.default_rng(0)
     R, world_size, n_chunks = 3, 2, 600
     n = R * wr.NUM_WINDOWS
-    chunk_article = rng.integers(0, 30, n_chunks)  # fewer articles than ARTICLE_K: duplicates everywhere, padding too
-    wiki_dir = tmp_path / "wiki"
-    wiki_dir.mkdir()
-    np.save(wiki_dir / "meta.npy", np.stack([chunk_article, np.zeros(n_chunks, dtype=np.int64)], axis=1))
-    monkeypatch.setattr(wr, "WIKI_DIR", str(wiki_dir))
+    content_ids = rng.integers(0, 30, n_chunks)  # fewer distinct texts than DISTINCT_K: duplicates everywhere, padding too
+    monkeypatch.setattr(wr, "chunk_content_ids", lambda: content_ids)
     monkeypatch.setattr(wr, "PACK_DIR", str(tmp_path))
     monkeypatch.setattr(wr, "packed_path", lambda split: str(tmp_path / f"{split}.npy"))
     np.save(tmp_path / "val.npy", np.zeros((R, 1), dtype=np.uint16))
@@ -135,24 +139,24 @@ def test_search_merge_matches_old_inline_loop(tmp_path, monkeypatch):
         np.save(scores_path, scores)
         shards.append((idx, scores))
 
-    # the pre-refactor merge + collapse, inline
+    # reference merge + collapse, inline
     idx_cat = np.concatenate([s[0] for s in shards], axis=1)
     score_cat = np.concatenate([s[1] for s in shards], axis=1)
     order = np.argsort(-score_cat, axis=1)[:, :wr.CAND_K]
     raw_idx = np.take_along_axis(idx_cat, order, axis=1)
     raw_scores = np.take_along_axis(score_cat, order, axis=1)
-    raw_articles = chunk_article[raw_idx]
-    want_ids = np.full((n, wr.ARTICLE_K), -1, dtype=np.int32)
-    want_scores = np.full((n, wr.ARTICLE_K), -1e9, dtype=np.float32)
+    raw_content = content_ids[raw_idx]
+    want_ids = np.full((n, wr.DISTINCT_K), -1, dtype=np.int32)
+    want_scores = np.full((n, wr.DISTINCT_K), -1e9, dtype=np.float32)
     for i in range(n):
-        _, first = np.unique(raw_articles[i], return_index=True)
-        keep = np.sort(first)[:wr.ARTICLE_K]
+        _, first = np.unique(raw_content[i], return_index=True)
+        keep = np.sort(first)[:wr.DISTINCT_K]
         want_ids[i, :len(keep)] = raw_idx[i, keep]
         want_scores[i, :len(keep)] = raw_scores[i, keep]
 
     wr.search_merge("val", world_size=world_size, merge_batch=7)  # odd batch size: exercises the batch boundaries
-    got_ids = np.load(tmp_path / "val_cand_ids.npy").reshape(n, wr.ARTICLE_K)
-    got_scores = np.load(tmp_path / "val_cand_scores.npy").reshape(n, wr.ARTICLE_K)
+    got_ids = np.load(tmp_path / "val_cand_ids.npy").reshape(n, wr.DISTINCT_K)
+    got_scores = np.load(tmp_path / "val_cand_scores.npy").reshape(n, wr.DISTINCT_K)
     assert (want_ids == -1).any()  # the padding path is covered
     assert np.array_equal(got_ids, want_ids)
     assert np.array_equal(got_scores, want_scores)

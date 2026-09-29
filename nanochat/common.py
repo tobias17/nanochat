@@ -3,6 +3,7 @@ Common utilities for nanochat.
 """
 
 import os
+import json
 import re
 import logging
 import urllib.request
@@ -221,6 +222,31 @@ class DummyWandb:
         pass
     def finish(self):
         pass
+
+class MetricsLog:
+    """
+    Writes every logged dict as a line of a local jsonl file (so runs can be compared offline without wandb,
+    see scripts/compare_runs.py), and forwards it to wandb. Master process only.
+    When resuming from step S, the records of steps >= S are dropped: the resumed run logs those steps again.
+    """
+    def __init__(self, path, wandb_run, resume_from_step=-1):
+        self.wandb_run = wandb_run
+        kept = []
+        if resume_from_step >= 0 and os.path.exists(path):
+            with open(path) as f:
+                kept = [line for line in f if json.loads(line).get("step", -1) < resume_from_step]
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.f = open(path, "w")
+        self.f.writelines(kept)
+        self.f.flush()
+    def log(self, data, to_wandb=True):
+        self.f.write(json.dumps(data) + "\n")
+        self.f.flush()
+        if to_wandb:
+            self.wandb_run.log(data)
+    def finish(self):
+        self.f.close()
+        self.wandb_run.finish()
 
 # hardcoded BF16 peak flops for various GPUs
 # inspired by torchtitan: https://github.com/pytorch/torchtitan/blob/main/torchtitan/tools/utils.py

@@ -3,6 +3,10 @@ New and upgraded chat mode because a lot of the code has changed since the last 
 
 Intended to be run single GPU only atm:
 python -m scripts.chat_cli
+
+The reference arms (ref_mode prefix/encoder) retrieve 8 wiki refs for the first user message of each conversation
+and keep them until 'clear', as in SFT. The wiki index is ~29GB in fp16, so it's sharded over --index-gpus
+(default: every GPU but the model's), e.g. CUDA_VISIBLE_DEVICES=0,1,2 python -m scripts.chat_cli -g cheat_sheet_d20
 """
 import argparse
 import torch
@@ -17,6 +21,7 @@ parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
 parser.add_argument('-p', '--prompt', type=str, default='', help='Prompt the model, get a single response back')
 parser.add_argument('-t', '--temperature', type=float, default=0.6, help='Temperature for generation')
 parser.add_argument('-k', '--top-k', type=int, default=50, help='Top-k sampling parameter')
+parser.add_argument('--index-gpus', type=str, default=None, help='Reference arms: comma separated GPUs for the wiki index (default: all but the model\'s)')
 parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
 args = parser.parse_args()
 
@@ -33,6 +38,18 @@ assistant_start, assistant_end = tokenizer.encode_special("<|assistant_start|>")
 
 # Create Engine for efficient generation
 engine = Engine(model, tokenizer)
+
+# Live retrieval for the reference arms (the same Retriever that precomputed the SFT/eval refs)
+retriever = None
+if model.config.ref_mode != "none":
+    from nanochat.wiki import Retriever, ref_tokens
+    if args.index_gpus:
+        index_gpus = [int(g) for g in args.index_gpus.split(",")]
+    else:
+        index_gpus = [g for g in range(torch.cuda.device_count()) if g != torch.cuda.current_device()]
+    print(f"Loading the wiki index onto GPUs {index_gpus}...")
+    retriever = Retriever(index_gpus, str(device))
+refs = None # the current conversation's refs, retrieved on its first user message
 
 print("\nNanoChat Interactive Mode")
 print("-" * 50)
@@ -62,11 +79,17 @@ while True:
 
     if user_input.lower() == 'clear':
         conversation_tokens = [bos]
+        refs = None
         print("Conversation cleared.")
         continue
 
     if not user_input:
         continue
+
+    if retriever is not None and refs is None:
+        ids, _ = retriever.retrieve([user_input])
+        refs = ref_tokens(ids[0]).tolist()
+        print("Refs: " + " | ".join(tokenizer.decode(ref[:12]).split("\n")[0] for ref in refs)) # chunks start with their title
 
     # Add User message to the conversation
     conversation_tokens.append(user_start)
@@ -80,6 +103,7 @@ while True:
         "max_tokens": 256,
         "temperature": args.temperature,
         "top_k": args.top_k,
+        "refs": refs,
     }
     response_tokens = []
     print("\nAssistant: ", end="", flush=True)

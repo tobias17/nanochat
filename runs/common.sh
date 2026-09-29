@@ -16,6 +16,7 @@
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 export HF_HUB_OFFLINE=1 # mpnet and Wikipedia are already in the HF cache, never revalidate them over the network
+export PYTHONUNBUFFERED=1 # progress reaches tee'd / redirected logs as it happens, not in 8KB blocks
 cd "$(dirname "${BASH_SOURCE[0]}")/.." # repo root, so the scripts work from any directory
 if [ -d .venv ]; then
     source .venv/bin/activate

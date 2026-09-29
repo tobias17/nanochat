@@ -144,7 +144,7 @@ def show_row(row_idx, viewer):
             print(f"  {sc}{BOLD}→ score={score:.4f}{RESET}  {BOLD_CYAN}{title}{RESET} {DIM}(chunk {chunk_idx}){RESET}")
             print("  " + wrap(chunk_text).replace("\n", "\n  "))
         else:
-            print(f"  {BOLD_RED}→ no reference (ran out of distinct-article candidates){RESET}")
+            print(f"  {BOLD_RED}→ no reference (ran out of distinct-text candidates){RESET}")
         print()
 
 def interactive(viewer, args):

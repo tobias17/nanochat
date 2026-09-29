@@ -12,11 +12,13 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-s
 import gc
 import argparse
 import os
+from dataclasses import asdict
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import wandb
+import numpy as np
 import torch
-from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
+from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, MetricsLog, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
 from nanochat.loss_eval import evaluate_bpb
@@ -24,8 +26,9 @@ import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3
 from nanochat.engine import Engine
 from scripts.chat_eval import run_chat_eval
+from nanochat.wiki import ref_tokens
 
-from tasks.common import TaskMixture
+from tasks.common import TaskMixture, attach_refs
 from tasks.gsm8k import GSM8K
 from tasks.mmlu import MMLU
 from tasks.smoltalk import SmolTalk
@@ -171,7 +174,15 @@ val_dataset = TaskMixture([
     MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
     GSM8K(subset="main", split="test", stop=420), # 1.32K rows in test set, use only 420 to match the train ratios
 ]) # total: 24K + 5.2K + 0.42K ~= 29.6K rows
+# The reference arms get each conversation's 8 wiki refs, precomputed on its first user message (runs/data.sh task_refs).
+# Every conversation has its own refs, so these get one conversation per row instead of best-fit packing.
+use_refs = orig_model.config.ref_mode != "none"
+if use_refs:
+    attach_refs(train_dataset)
+    attach_refs(val_dataset)
+    print0(f"ref_mode={orig_model.config.ref_mode}: one conversation per row, each with its own {orig_model.config.n_ref} refs")
 # DataLoader is defined here, it emits inputs, targets : 2D tensors of shape (device_batch_size, max_seq_len)
+# and refs: (device_batch_size, n_ref, ref_len) with use_refs, else None
 # A big problem is that we don't know the final num_iterations in advance. So we create
 # these two global variables and update them from within the data generator.
 last_step = False # we will toggle this to True when we reach the end of the training dataset
@@ -185,6 +196,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     Conversations are packed using best-fit algorithm. When no conversation fits,
     the row is padded (instead of cropping) to ensure no tokens are ever discarded.
     Padding positions have targets masked with -1 (ignore_index for cross-entropy).
+    With use_refs, each row holds just one conversation (the oldest in the buffer), padded, plus its refs.
     """
     global last_step, approx_progress, current_epoch
     assert split in {"train", "val"}, "split must be 'train' or 'val'"
@@ -194,7 +206,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     row_capacity = args.max_seq_len + 1  # +1 for target at last position
     bos_token = tokenizer.get_bos_token_id()
 
-    # Conversation buffer: list of (token_ids, loss_mask) tuples
+    # Conversation buffer: list of (token_ids, loss_mask, ref_ids) tuples (ref_ids is None without use_refs)
     conv_buffer = []
     cursor = ddp_rank  # Each rank processes different conversations (for fetching)
     consumed = ddp_rank  # Track actual consumption separately from buffering
@@ -206,7 +218,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         while len(conv_buffer) < buffer_size:
             conversation = dataset[cursor]
             ids, mask = tokenizer.render_conversation(conversation)
-            conv_buffer.append((ids, mask))
+            conv_buffer.append((ids, mask, conversation.get("ref_ids")))
             cursor += ddp_world_size
             if cursor >= dataset_size:
                 cursor = cursor % dataset_size
@@ -217,6 +229,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         rows = []
         mask_rows = []
         row_lengths = []  # Track actual content length (excluding padding) for each row
+        row_refs = []  # With use_refs: the ref_ids of each row's conversation
         for _ in range(args.device_batch_size):
             row = []
             mask_row = []
@@ -231,17 +244,23 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                 # Find largest conversation that fits entirely
                 best_idx = -1
                 best_len = 0
-                for i, (conv, _) in enumerate(conv_buffer):
-                    conv_len = len(conv)
-                    if conv_len <= remaining and conv_len > best_len:
-                        best_idx = i
-                        best_len = conv_len
+                if use_refs:
+                    if not row:
+                        best_idx = 0 # one conversation per row, in order (render_conversation crops them to fit)
+                else:
+                    for i, (conv, *_) in enumerate(conv_buffer):
+                        conv_len = len(conv)
+                        if conv_len <= remaining and conv_len > best_len:
+                            best_idx = i
+                            best_len = conv_len
 
                 if best_idx >= 0:
                     # Found a conversation that fits - use it entirely
-                    conv, conv_mask = conv_buffer.pop(best_idx)
+                    conv, conv_mask, ref_ids = conv_buffer.pop(best_idx)
                     row.extend(conv)
                     mask_row.extend(conv_mask)
+                    if use_refs:
+                        row_refs.append(ref_ids)
                     consumed += ddp_world_size  # Track actual consumption
                 else:
                     # No conversation fits - pad the remainder instead of cropping
@@ -260,16 +279,17 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             rows.append(row[:row_capacity])
             mask_rows.append(mask_row[:row_capacity])
 
-        # Stopping condition to respect num_iterations, if given
+        # Stopping condition to respect num_iterations, if given. `it` counts micro-batches: grad_accum_steps per
+        # optimization step, plus the one prefetched before the loop
         it += 1
-        if 0 < args.num_iterations <= it and split == "train":
+        if 0 < args.num_iterations and it > args.num_iterations * grad_accum_steps and split == "train":
             last_step = True
 
         # Update progress tracking (based on consumed, not cursor, to account for buffering)
         if split == "train":
             current_epoch = epoch
             if args.num_iterations > 0:
-                approx_progress = it / args.num_iterations
+                approx_progress = (it - 1) / (args.num_iterations * grad_accum_steps) # = step / num_iterations after each step
             else:
                 approx_progress = consumed / dataset_size
             # Trigger last_step when we've consumed enough (instead of when cursor wraps)
@@ -295,7 +315,12 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             if content_len < row_capacity:
                 targets[i, content_len-1:] = -1
 
-        yield inputs, targets
+        refs = None
+        if use_refs:
+            refs_tensor = torch.from_numpy(np.stack([ref_tokens(ids) for ids in row_refs]))
+            refs = refs_tensor.pin_memory().to(device=device, non_blocking=True) if use_cuda else refs_tensor.to(device)
+
+        yield inputs, targets, refs
 
 train_loader = sft_data_generator_bos_bestfit("train")
 build_val_loader = lambda: sft_data_generator_bos_bestfit("val")
@@ -319,9 +344,15 @@ def get_muon_momentum(it):
     momentum = (1 - frac) * 0.85 + frac * 0.95
     return momentum
 
+# Local copy of everything logged (val bpb, ChatCORE, train stats), next to the checkpoint
+output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
+checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
+metrics = MetricsLog(os.path.join(checkpoint_dir, "metrics.jsonl"), wandb_run) if master_process else wandb_run
+metrics.log({"config": {"user_config": user_config, "model_config": asdict(orig_model.config)}}, to_wandb=False)
+
 # -----------------------------------------------------------------------------
 # Training loop
-x, y = next(train_loader) # prefetch the very first batch of data
+x, y, refs = next(train_loader) # prefetch the very first batch of data
 min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
@@ -345,7 +376,7 @@ while True:
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
+        metrics.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
@@ -379,7 +410,7 @@ while True:
         chatcore = centered_mean(all_tasks)
         chatcore_cat = centered_mean(categorical_tasks)
         print0(f"Step {step:05d} | ChatCORE: {chatcore:.4f} | ChatCORE_cat: {chatcore_cat:.4f}")
-        wandb_run.log({
+        metrics.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "chatcore_metric": chatcore,
@@ -390,8 +421,6 @@ while True:
 
     # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
     if last_step:
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
-        checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -400,15 +429,7 @@ while True:
             {
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
-                "model_config": {
-                    "sequence_len": args.max_seq_len,
-                    "vocab_size": tokenizer.get_vocab_size(),
-                    "n_layer": depth,
-                    "n_head": model.config.n_head,
-                    "n_kv_head": model.config.n_kv_head,
-                    "n_embd": model.config.n_embd,
-                    "window_pattern": model.config.window_pattern,
-                },
+                "model_config": {**asdict(orig_model.config), "sequence_len": args.max_seq_len}, # (incl. the ref config)
                 "user_config": user_config, # inputs to the training script
             },
             rank=ddp_rank,
@@ -423,14 +444,14 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        loss = model(x, y, refs=refs)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        x, y, refs = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
         progress = max(progress, approx_progress) # only increase progress monotonically
     # step the optimizer
     lrm = get_lr_multiplier(progress)
@@ -467,18 +488,17 @@ while True:
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {current_epoch} | total time: {total_training_time/60:.2f}m")
-    if step % 10 == 0:
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "train/loss": debiased_smooth_loss,
-            "train/lrm": lrm,
-            "train/dt": dt,
-            "train/tok_per_sec": tok_per_sec,
-            "train/mfu": mfu,
-            "train/epoch": current_epoch,
-        })
+    metrics.log({
+        "step": step,
+        "total_training_flops": flops_so_far,
+        "total_training_time": total_training_time,
+        "train/loss": debiased_smooth_loss,
+        "train/lrm": lrm,
+        "train/dt": dt,
+        "train/tok_per_sec": tok_per_sec,
+        "train/mfu": mfu,
+        "train/epoch": current_epoch,
+    }, to_wandb=step % 10 == 0) # every step to the local log
 
     # The garbage collector spends ~500ms scanning for cycles quite frequently.
     # We manually manage it to avoid these pauses during training.
@@ -495,5 +515,5 @@ print0(f"Total training time: {total_training_time/60:.2f}m")
 print0(f"Minimum validation bpb: {min_val_bpb:.4f}")
 
 # cleanup
-wandb_run.finish() # wandb run finish
+metrics.finish() # local log + wandb run finish
 compute_cleanup()

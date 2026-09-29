@@ -17,7 +17,7 @@ import nanochat.pack
 from nanochat.pack import DOC_WIDTH, ROW_WIDTH, NUM_WINDOWS, WINDOW_LEN
 from nanochat.dataloader import BestFitPacker, packed_data_loader_with_state
 from nanochat.wiki import split_list_with_overlap, embed_rows_to_memmap
-from scripts.wiki_retrieve import dedup_row, ARTICLE_K
+from scripts.wiki_retrieve import dedup_row, DISTINCT_K
 
 CORPUS = [
     "The quick brown fox jumps over the lazy dog.",
@@ -104,32 +104,40 @@ def test_split_list_with_overlap_consecutive_chunks_overlap():
 def test_dedup_row_no_conflicts_keeps_top1():
     cand_ids = np.array([[10, 11, 12], [20, 21, 22], [30, 31, 32]])
     cand_scores = np.array([[0.9, 0.8, 0.7], [0.85, 0.5, 0.4], [0.6, 0.3, 0.2]])
-    chunk_article = {10: 1, 11: 1, 12: 1, 20: 2, 21: 2, 22: 2, 30: 3, 31: 3, 32: 3}
-    chunk, score = dedup_row(cand_ids, cand_scores, chunk_article)
+    content_ids = {c: c for c in cand_ids.flatten().tolist()}
+    chunk, score = dedup_row(cand_ids, cand_scores, content_ids)
     assert chunk == [10, 20, 30]
 
 def test_dedup_row_resolves_conflict_by_score_and_terminates():
-    # windows 0 and 1 both want article 1 at rank 0; window 1 has the higher score and should win
-    cand_ids = np.array([[10, 13], [11, 14]])
+    # windows 0 and 1 both want chunk 10 at rank 0; window 1 has the higher score and should win
+    cand_ids = np.array([[10, 13], [10, 14]])
     cand_scores = np.array([[0.5, 0.1], [0.9, 0.2]])
-    chunk_article = {10: 1, 13: 5, 11: 1, 14: 6}
-    chunk, score = dedup_row(cand_ids, cand_scores, chunk_article)
-    assert chunk[1] == 11  # window 1 keeps its top choice (higher score)
-    assert chunk[0] == 13  # window 0 was displaced to its next candidate
-    assert chunk_article[chunk[0]] != chunk_article[chunk[1]]
+    content_ids = {10: 10, 13: 13, 14: 14}
+    chunk, score = dedup_row(cand_ids, cand_scores, content_ids)
+    assert chunk == [13, 10]  # window 1 keeps its top choice, window 0 was displaced to its next candidate
+    assert score == [0.1, 0.9]
 
-def test_dedup_row_no_duplicate_articles_with_heavy_overlap():
+def test_dedup_row_identical_texts_conflict_but_same_article_does_not():
+    # chunk 11 is a byte-identical copy of chunk 10 (content id 10); chunk 12 is a different text,
+    # e.g. the next chunk of the same article, which is allowed alongside 10
+    cand_ids = np.array([[10, 20], [11, 21], [12, 22]])
+    cand_scores = np.array([[0.9, 0.1], [0.8, 0.2], [0.7, 0.3]])
+    content_ids = {10: 10, 11: 10, 12: 12, 20: 20, 21: 21, 22: 22}
+    chunk, score = dedup_row(cand_ids, cand_scores, content_ids)
+    assert chunk == [10, 21, 12]
+
+def test_dedup_row_no_duplicate_texts_with_heavy_overlap():
     num_windows = 8
     rng = np.random.default_rng(0)
-    cand_ids = np.arange(num_windows * ARTICLE_K).reshape(num_windows, ARTICLE_K)
-    cand_scores = -np.sort(-rng.random((num_windows, ARTICLE_K)), axis=1)  # descending, like real candidates
-    # every window's 32 candidates cycle through all 16 possible articles (32 % 16 == 0),
+    cand_ids = np.arange(num_windows * DISTINCT_K).reshape(num_windows, DISTINCT_K)
+    cand_scores = -np.sort(-rng.random((num_windows, DISTINCT_K)), axis=1)  # descending, like real candidates
+    # every window's 32 candidates cycle through 16 distinct texts (32 % 16 == 0),
     # so conflicts are frequent but always resolvable
-    chunk_article = {int(c): int(c) % 16 for c in cand_ids.flatten()}
-    chunk, score = dedup_row(cand_ids, cand_scores, chunk_article)
+    content_ids = {int(c): int(c) % 16 for c in cand_ids.flatten()}
+    chunk, score = dedup_row(cand_ids, cand_scores, content_ids)
     assert all(c >= 0 for c in chunk)  # never runs out of candidates in this regime
-    assigned_articles = [chunk_article[c] for c in chunk]
-    assert len(assigned_articles) == len(set(assigned_articles))
+    assigned = [content_ids[c] for c in chunk]
+    assert len(assigned) == len(set(assigned))
 
 # -----------------------------------------------------------------------------
 # packed-row training loader

@@ -9,8 +9,8 @@ offline steps:
     python -m nanochat.wiki build   # tokenize + chunk all of Wikipedia
     python -m nanochat.wiki embed   # embed every chunk with mpnet
 
-See scripts/wiki_retrieve.py (joins packed rows' windows to wiki chunks, with
-article-level dedup) and scripts/wiki_view.py (inspect the results interactively).
+See scripts/wiki_retrieve.py (joins packed rows' windows to wiki chunks, never
+repeating a chunk's text within a row) and scripts/wiki_view.py (inspect the results interactively).
 """
 import os
 import re
@@ -362,28 +362,63 @@ class WikiIndex:
         return top_idx.numpy(), top_vals.numpy()
 
 # -----------------------------------------------------------------------------
-# Distinct-article retrieval
+# Distinct-chunk retrieval: refs may share an article, but never repeat the same text
 
-def top_distinct_articles(raw_idx, raw_scores, chunk_article, k):
+def chunk_content_ids(wiki_dir=None, block=1 << 20):
     """
-    raw_idx/raw_scores: (Q, K) score-sorted (descending) chunk ids and scores. Keeps each article's best
-    chunk, in score order, up to k per query. Returns (ids (Q, k) int32, scores (Q, k) float32), padded
-    with -1 / -1e9 when a query has fewer than k distinct articles.
+    (n_chunks,) int32: for each chunk, the smallest chunk id with byte-identical tokens (itself if its text
+    is unique). Wikipedia has some duplicated text across articles, so deduping refs by chunk id alone
+    would let the same text in twice. Computed once, cached as content_ids.npy next to tokens.npy.
     """
-    Q = raw_idx.shape[0]
-    raw_articles = chunk_article[raw_idx]
+    wiki_dir = wiki_dir or WIKI_DIR
+    path = os.path.join(wiki_dir, "content_ids.npy")
+    tokens = np.load(os.path.join(wiki_dir, "tokens.npy"), mmap_mode="r")
+    if os.path.exists(path):
+        content_ids = np.load(path)
+        if len(content_ids) == tokens.shape[0]:  # else left over from a previous wiki build
+            return content_ids
+    import hashlib
+    n, row_bytes = tokens.shape[0], tokens.shape[1] * tokens.itemsize
+    digests = []
+    for s in range(0, n, block):
+        buf = np.ascontiguousarray(tokens[s:s + block]).tobytes()
+        digests += [hashlib.blake2b(buf[j:j + row_bytes], digest_size=8).digest() for j in range(0, len(buf), row_bytes)]
+    h = np.frombuffer(b"".join(digests), dtype=np.uint64)
+    _, first, inverse = np.unique(h, return_index=True, return_inverse=True)
+    content_ids = first[inverse].astype(np.int32)
+    dup = np.flatnonzero(content_ids != np.arange(n))
+    for s in range(0, len(dup), block):  # a hash collision would silently merge different texts
+        d = dup[s:s + block]
+        assert (tokens[d] == tokens[content_ids[d]]).all(), "blake2b collision between different chunks"
+    tmp = os.path.join(wiki_dir, "content_ids.tmp.npy")
+    np.save(tmp, content_ids)
+    os.replace(tmp, path)
+    print(f"content_ids: {len(dup)} of {n} chunks duplicate an earlier chunk's text")
+    return content_ids
+
+def top_distinct(raw_idx, raw_scores, content_ids, k):
+    """
+    raw_idx/raw_scores: (Q, K) score-sorted (descending) chunk ids and scores. Keeps the first chunk of each
+    distinct text, in score order, up to k per query. Returns (ids (Q, k) int32, scores (Q, k) float32),
+    padded with -1 / -1e9 when a query has fewer than k distinct texts.
+    """
+    Q, K = raw_idx.shape
+    m = min(k, K)
     ids = np.full((Q, k), -1, dtype=np.int32)
     scores = np.full((Q, k), -1e9, dtype=np.float32)
-    for i in range(Q):
-        # first hit per article is its best, since raw_idx is score-sorted; keep those in score order
-        _, first = np.unique(raw_articles[i], return_index=True)
+    ids[:, :m], scores[:, :m] = raw_idx[:, :m], raw_scores[:, :m]
+    # the top m are the answer unless they contain a copied text, which is rare: redo just those queries
+    head = np.sort(content_ids[raw_idx[:, :m]], axis=1)
+    for i in np.flatnonzero((head[:, 1:] == head[:, :-1]).any(axis=1)):
+        _, first = np.unique(content_ids[raw_idx[i]], return_index=True)
         keep = np.sort(first)[:k]
+        ids[i], scores[i] = -1, -1e9
         ids[i, :len(keep)] = raw_idx[i, keep]
         scores[i, :len(keep)] = raw_scores[i, keep]
     return ids, scores
 
 class Retriever:
-    """ Query text -> n_ref chunks from n_ref distinct wiki articles. Used for offline SFT/eval ref
+    """ Query text -> its n_ref nearest wiki chunks with distinct texts. Used for offline SFT/eval ref
     precompute and for live chat, so both retrieve identically. """
     def __init__(self, index_gpus, embed_device, n_ref=8, cand_k=128, dtype="fp16"):
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -391,24 +426,29 @@ class Retriever:
         self.n_ref, self.cand_k = n_ref, cand_k
         self.model = SentenceTransformer(EMBED_MODEL_NAME, device=embed_device)
         self.index = WikiIndex(dtype=dtype, gpus=index_gpus)
-        self.chunk_article = np.load(os.path.join(WIKI_DIR, "meta.npy"))[:, 0]
-        self.tokens = np.load(os.path.join(WIKI_DIR, "tokens.npy"), mmap_mode="r")
+        self.content_ids = chunk_content_ids()
 
     def retrieve(self, texts, batch_size=256):
-        """ Returns (ids (Q, n_ref) int32, scores (Q, n_ref) float32); -1 id = fewer than n_ref distinct articles. """
+        """ Returns (ids (Q, n_ref) int32, scores (Q, n_ref) float32); -1 id = fewer than n_ref distinct texts. """
         ids, scores = [], []
         for bstart in range(0, len(texts), batch_size):
             vecs = self.model.encode(texts[bstart:bstart + batch_size], normalize_embeddings=True, show_progress_bar=False)
             raw_idx, raw_scores = self.index.search(vecs, self.cand_k)
-            i, s = top_distinct_articles(raw_idx, raw_scores, self.chunk_article, self.n_ref)
+            i, s = top_distinct(raw_idx, raw_scores, self.content_ids, self.n_ref)
             ids.append(i)
             scores.append(s)
         return np.concatenate(ids), np.concatenate(scores)
 
-    def ref_tokens(self, ids):
-        """ (n_ref,) chunk ids -> (n_ref, chunk_len) uint16 token array. """
-        assert all(i >= 0 for i in ids), f"missing refs (-1) in {ids}"
-        return np.stack([self.tokens[i] for i in ids])
+_chunk_tokens = None
+def ref_tokens(ids):
+    """ (n_ref,) wiki chunk ids (e.g. a conversation's "ref_ids", or Retriever.retrieve) -> (n_ref, chunk_len)
+    int64 token array, the refs as the model takes them. """
+    global _chunk_tokens
+    if _chunk_tokens is None:
+        _chunk_tokens = np.load(os.path.join(WIKI_DIR, "tokens.npy"), mmap_mode="r")
+    ids = np.asarray(ids)
+    assert (ids >= 0).all(), f"missing refs (-1) in {ids}"
+    return _chunk_tokens[ids].astype(np.int64)
 
 # -----------------------------------------------------------------------------
 

@@ -10,13 +10,16 @@ torchrun --nproc_per_node=8 -m scripts.chat_eval -- -i sft -a ARC-Easy
 
 import argparse
 from functools import partial
+import numpy as np
 import torch
 import torch.distributed as dist
 
 from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
+from nanochat.wiki import ref_tokens
 
+from tasks.common import attach_refs
 from tasks.humaneval import HumanEval
 from tasks.mmlu import MMLU
 from tasks.arc import ARC
@@ -39,13 +42,15 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
 
         # Tokenize the prompt
         encoded_prompt = tokenizer.render_for_completion(conversation)
-        # Get the completions
+        # Get the completions (the reference arms also get the problem's precomputed wiki refs)
+        refs = ref_tokens(conversation["ref_ids"]).tolist() if "ref_ids" in conversation else None
         results, _ = engine.generate_batch(
             encoded_prompt,
             num_samples=num_samples,
             max_tokens=max_new_tokens,
             temperature=temperature,
             top_k=top_k,
+            refs=refs,
         )
         # Decode the completions as text
         prefix_length = len(encoded_prompt)
@@ -108,10 +113,13 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
         answer_time_positions = [len(ids) - 1 for ids in prompt_ids] # where the last token is (and the predicted answer)
         padded_prompt_ids = [ids + [bos] * (max_length - len(ids)) for ids in prompt_ids]
         prompt_ids = torch.tensor(padded_prompt_ids, dtype=torch.long, device=device)
+        refs = None
+        if "ref_ids" in conversations[0]: # the reference arms also get each problem's precomputed wiki refs
+            refs = torch.from_numpy(np.stack([ref_tokens(c["ref_ids"]) for c in conversations])).to(device)
 
         # Get the logits for the whole batch of conversations in parallel (efficiency win here)
         with torch.no_grad():
-            logits = model(prompt_ids) # (B, T, V)
+            logits = model(prompt_ids, refs=refs) # (B, T, V)
 
         # Focus on the available answer on just the letters corresponding to choices
         # Note that this helps the evaluation a lot because it specifically narrows the focus to only the available letters
@@ -165,6 +173,8 @@ def run_chat_eval(task_name, model, tokenizer, engine,
         'GSM8K': partial(GSM8K, subset="main", split="test"),
     }[task_name]
     task_object = task_module()
+    if model.config.ref_mode != "none":
+        attach_refs(task_object) # each problem's 8 wiki refs, precomputed by runs/data.sh task_refs
     # Run the evaluation
     if task_object.eval_type == 'generative':
         acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems)

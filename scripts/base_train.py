@@ -28,7 +28,7 @@ import torch.distributed as dist
 from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit, packed_data_loader, packed_data_loader_with_state
 from nanochat.pack import NUM_WINDOWS, WINDOW_LEN, packed_path
-from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
+from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, MetricsLog, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
@@ -75,6 +75,7 @@ parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR 
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
+parser.add_argument("--eval-every-flops", type=float, default=-1.0, help="instead evaluate val bpb at the first step past every multiple of this many training FLOPs, so runs with different FLOPs per step are evaluated at the same compute (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
@@ -82,7 +83,7 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
-parser.add_argument("--dry-run", action="store_true", help="print the model size and training horizon, then exit without allocating or training the model")
+parser.add_argument("--plan", action="store_true", help="print the model size and training horizon, then exit without allocating or training the model")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -155,7 +156,7 @@ model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtyp
 model_config = model.config
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
-if not args.dry_run: # (a dry run only needs shapes, which the meta model already has)
+if not args.plan: # (a plan only needs shapes, which the meta model already has)
     model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
     model.init_weights() # 3) All tensors get initialized
 
@@ -338,12 +339,12 @@ print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
 use_packed = args.ref_mode != "none" # the reference arms train on the offline pre-packed rows (which carry the refs)
-if args.dry_run:
+if args.plan:
     if use_packed and os.path.exists(packed_path("train")):
         import numpy as np
         available_tokens = np.load(packed_path("train"), mmap_mode="r").shape[0] * args.max_seq_len
         print0(f"Packed train tokens available: {available_tokens:,} => this run would use {total_tokens / available_tokens:.2f} epochs")
-    print0("Dry run, exiting")
+    print0("Plan only, exiting")
     wandb_run.finish()
     compute_cleanup()
     exit()
@@ -422,6 +423,18 @@ if use_packed and (args.core_metric_every > 0 or args.sample_every > 0):
     print0(f"WARNING: CORE metric and sampling are not supported yet for --ref-mode={args.ref_mode}, disabling them")
     args.core_metric_every = args.sample_every = -1
 
+# Local metrics log (a copy of everything logged to wandb, plus the train stats of every step), for comparing runs on the FLOPs axis
+metrics = MetricsLog(os.path.join(checkpoint_dir, "metrics.jsonl"), wandb_run, args.resume_from_step) if master_process else wandb_run
+metrics.log({"config": {
+    "user_config": user_config,
+    "model_config": model_config_kwargs,
+    "param_counts": param_counts,
+    "num_scaling_params": num_scaling_params,
+    "flops_per_token": num_flops_per_token,
+    "total_batch_size": total_batch_size,
+    "num_iterations": num_iterations,
+}}, to_wandb=False)
+
 # Loop state (variables updated by the training loop)
 if not resuming:
     step = 0
@@ -447,12 +460,17 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
 # Go!
+flops_per_step = num_flops_per_token * total_batch_size
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
-    flops_so_far = num_flops_per_token * total_batch_size * step
+    flops_so_far = flops_per_step * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
-    if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
+    if args.eval_every_flops > 0:
+        eval_now = last_step or flops_so_far // args.eval_every_flops > (flops_so_far - flops_per_step) // args.eval_every_flops
+    else:
+        eval_now = args.eval_every > 0 and (last_step or step % args.eval_every == 0)
+    if eval_now:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
@@ -461,7 +479,7 @@ while True:
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
+        metrics.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
@@ -478,7 +496,7 @@ while True:
         with disable_fp8(orig_model):
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({
+        metrics.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "core_metric": results["core_metric"],
@@ -602,19 +620,18 @@ while True:
     else:
         epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    if step % 100 == 0:
-        log_data = {
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "train/loss": debiased_smooth_loss,
-            "train/lrm": lrm,
-            "train/dt": dt,
-            "train/tok_per_sec": tok_per_sec,
-            "train/mfu": mfu,
-            "train/epoch": epoch,
-        }
-        wandb_run.log(log_data)
+    log_data = {
+        "step": step,
+        "total_training_flops": flops_so_far,
+        "total_training_time": total_training_time,
+        "train/loss": debiased_smooth_loss,
+        "train/lrm": lrm,
+        "train/dt": dt,
+        "train/tok_per_sec": tok_per_sec,
+        "train/mfu": mfu,
+        "train/epoch": epoch,
+    }
+    metrics.log(log_data, to_wandb=step % 100 == 0) # every step locally, every 100 to wandb
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
@@ -637,5 +654,5 @@ if val_bpb is not None:
     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
 
 # cleanup
-wandb_run.finish() # wandb run finish
+metrics.finish() # close the local metrics log and finish the wandb run
 compute_cleanup()

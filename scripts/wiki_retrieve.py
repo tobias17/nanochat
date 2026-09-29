@@ -1,7 +1,8 @@
 """
 Join packed pretraining rows (see nanochat.pack) to Wikipedia, per 256-token window,
-with article-level deduplication: no two of a row's 8 windows may end up referencing
-chunks from the same Wikipedia article. Three offline steps, run after nanochat.wiki
+never repeating a chunk's text: no two of a row's 8 windows may end up referencing
+the same chunk (or byte-identical copies of it, see nanochat.wiki.chunk_content_ids); different
+chunks of one article are fine. Three offline steps, run after nanochat.wiki
 build + embed:
 
     python -m scripts.wiki_retrieve embed-windows --split train
@@ -9,14 +10,14 @@ build + embed:
     python -m scripts.wiki_retrieve search-merge --split train
     python -m scripts.wiki_retrieve dedup --split train
 
-and one more for SFT / eval conversations, which get 8 distinct-article refs each, retrieved on the
+and one more for SFT / eval conversations, which get their 8 nearest distinct-text chunks each, retrieved on the
 question / user prompt (see Task.retrieval_query):
 
     python -m scripts.wiki_retrieve tasks   # writes <base_dir>/task_refs/{ref_key}_{ids,scores}.npy + {ref_key}.json
 
 Writes, under <base_dir>/packed/:
   {split}_qemb.npy         (R*8, dim) fp16    -- window embeddings
-  {split}_cand_ids.npy      (R, 8, 32) int32   -- top distinct-article wiki chunk ids per window, score-sorted
+  {split}_cand_ids.npy      (R, 8, 32) int32   -- top distinct-text wiki chunk ids per window, score-sorted
   {split}_cand_scores.npy   (R, 8, 32) float32
   {split}_ref_ids.npy       (R, 8) int32       -- final deduped chunk id per window
   {split}_ref_scores.npy    (R, 8) float32
@@ -32,10 +33,10 @@ import numpy as np
 
 from nanochat.tokenizer import get_tokenizer
 from nanochat.pack import PACK_DIR, DOC_WIDTH, NUM_WINDOWS, WINDOW_LEN, packed_path
-from nanochat.wiki import WIKI_DIR, EMBED_MODEL_NAME, embed_rows_to_memmap, top_distinct_articles
+from nanochat.wiki import WIKI_DIR, EMBED_MODEL_NAME, embed_rows_to_memmap, top_distinct, chunk_content_ids
 
-CAND_K = 128    # raw nearest chunks fetched per window before collapsing to distinct articles
-ARTICLE_K = 32  # distinct-article candidates kept per window after collapsing (8 windows can never need more than 8)
+CAND_K = 128     # raw nearest chunks fetched per window before collapsing duplicate texts
+DISTINCT_K = 32  # distinct-text candidates kept per window (8 windows can never need more than 8)
 
 def _window_ids(rows, row_idx, w, bos_id):
     start = w * WINDOW_LEN
@@ -140,31 +141,33 @@ def search_shard(split, rank, world_size=6, wiki_dtype="fp16", gpu=None, block_s
     print(f"rank {rank} ({device}): done, shard [{row_start}:{row_end}) top-{CAND_K}")
 
 def search_merge(split, world_size=6, merge_batch=200_000):
-    """ Combine world_size shards' local top-CAND_K into each window's top-ARTICLE_K distinct-article
+    """ Combine world_size shards' local top-CAND_K into each window's top-DISTINCT_K distinct-text
     candidates (score-sorted), then delete the per-shard temp files. """
     rows = np.load(packed_path(split), mmap_mode="r")
     R = rows.shape[0]
     n = R * NUM_WINDOWS
-    chunk_article = np.load(os.path.join(WIKI_DIR, "meta.npy"))[:, 0]  # meta is (n_chunks, 2): [article, chunk_idx]
+    content_ids = chunk_content_ids()
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"  # full sort of world_size*CAND_K scores is the CPU bottleneck
 
     shard_idx = [np.load(_shard_paths(split, r)[0], mmap_mode="r") for r in range(world_size)]
     shard_scores = [np.load(_shard_paths(split, r)[1], mmap_mode="r") for r in range(world_size)]
 
     cand_ids = np.lib.format.open_memmap(
-        os.path.join(PACK_DIR, f"{split}_cand_ids.npy"), mode="w+", dtype=np.int32, shape=(R, NUM_WINDOWS, ARTICLE_K))
+        os.path.join(PACK_DIR, f"{split}_cand_ids.npy"), mode="w+", dtype=np.int32, shape=(R, NUM_WINDOWS, DISTINCT_K))
     cand_scores = np.lib.format.open_memmap(
-        os.path.join(PACK_DIR, f"{split}_cand_scores.npy"), mode="w+", dtype=np.float32, shape=(R, NUM_WINDOWS, ARTICLE_K))
-    cand_ids_flat, cand_scores_flat = cand_ids.reshape(n, ARTICLE_K), cand_scores.reshape(n, ARTICLE_K)  # one row per window
+        os.path.join(PACK_DIR, f"{split}_cand_scores.npy"), mode="w+", dtype=np.float32, shape=(R, NUM_WINDOWS, DISTINCT_K))
+    cand_ids_flat, cand_scores_flat = cand_ids.reshape(n, DISTINCT_K), cand_scores.reshape(n, DISTINCT_K)  # one row per window
 
     t0 = time.time()
     for bstart in range(0, n, merge_batch):
         bend = min(bstart + merge_batch, n)
         idx_cat = np.concatenate([s[bstart:bend] for s in shard_idx], axis=1)      # (b, world_size*CAND_K)
         score_cat = np.concatenate([s[bstart:bend] for s in shard_scores], axis=1)
-        order = np.argsort(-score_cat, axis=1)[:, :CAND_K]
-        raw_idx = np.take_along_axis(idx_cat, order, axis=1)
-        raw_scores = np.take_along_axis(score_cat, order, axis=1)
-        batch_ids, batch_scores = top_distinct_articles(raw_idx, raw_scores, chunk_article, ARTICLE_K)
+        top_scores, pos = torch.topk(torch.from_numpy(score_cat).to(device), CAND_K, dim=1)  # sorted descending
+        raw_idx = torch.gather(torch.from_numpy(idx_cat).to(device), 1, pos).cpu().numpy()
+        raw_scores = top_scores.cpu().numpy()
+        batch_ids, batch_scores = top_distinct(raw_idx, raw_scores, content_ids, DISTINCT_K)
         cand_ids_flat[bstart:bend] = batch_ids
         cand_scores_flat[bstart:bend] = batch_scores
         if (bstart // merge_batch) % 5 == 0 or bend == n:
@@ -172,7 +175,7 @@ def search_merge(split, world_size=6, merge_batch=200_000):
             print(f"search-merge: {bend}/{n} windows ({rate:.0f}/s)")
     cand_ids.flush()
     cand_scores.flush()
-    print(f"Wrote per-window article candidates for {R} rows to {PACK_DIR}")
+    print(f"Wrote per-window distinct-text candidates for {R} rows to {PACK_DIR}")
 
     for r in range(world_size):
         for p in _shard_paths(split, r):
@@ -180,16 +183,16 @@ def search_merge(split, world_size=6, merge_batch=200_000):
 
 # -----------------------------------------------------------------------------
 
-def dedup_row(cand_ids_row, cand_scores_row, chunk_article):
+def dedup_row(cand_ids_row, cand_scores_row, content_ids):
     """
-    Article-level dedup for one row's candidate lists.
+    Distinct-text dedup for one row's candidate lists.
 
     cand_ids_row/cand_scores_row: (num_windows, K), score-sorted descending per window,
-    -1 id = no more candidates. chunk_article: chunk_id -> article_id lookup.
+    -1 id = no more candidates. content_ids: chunk_id -> id of its text (identical texts share one).
 
-    Each window starts at its best candidate; whenever two windows share an article, the
+    Each window starts at its best candidate; whenever two windows share a text, the
     lower-scoring one advances to its next candidate. Repeats until no two windows share
-    an article. Terminates because a window's candidate cursor only moves forward.
+    a text. Terminates because a window's candidate cursor only moves forward.
     Returns (chunk_ids, scores), each length num_windows (-1/-1e9 if a window ran out of
     candidates, which shouldn't happen once K is comfortably larger than num_windows).
     """
@@ -197,11 +200,11 @@ def dedup_row(cand_ids_row, cand_scores_row, chunk_article):
     cursor = [0] * num_windows
     chunk = [int(cand_ids_row[w, 0]) for w in range(num_windows)]
     score = [float(cand_scores_row[w, 0]) for w in range(num_windows)]
-    article = [int(chunk_article[c]) if c >= 0 else -1 for c in chunk]
+    content = [int(content_ids[c]) if c >= 0 else -1 for c in chunk]
     pairs = list(itertools.combinations(range(num_windows), 2))
 
     while True:
-        conflict = next((p for p in pairs if article[p[0]] == article[p[1]] and article[p[0]] != -1), None)
+        conflict = next((p for p in pairs if content[p[0]] == content[p[1]] and content[p[0]] != -1), None)
         if conflict is None:
             break
         a, b = conflict
@@ -211,9 +214,9 @@ def dedup_row(cand_ids_row, cand_scores_row, chunk_article):
         if j < k and cand_ids_row[loser, j] >= 0:
             chunk[loser] = int(cand_ids_row[loser, j])
             score[loser] = float(cand_scores_row[loser, j])
-            article[loser] = int(chunk_article[chunk[loser]])
+            content[loser] = int(content_ids[chunk[loser]])
         else:
-            chunk[loser], score[loser], article[loser] = -1, -1e9, -1  # ran out of candidates
+            chunk[loser], score[loser], content[loser] = -1, -1e9, -1  # ran out of candidates
     return chunk, score
 
 def dedup_and_fill(split):
@@ -221,7 +224,7 @@ def dedup_and_fill(split):
     R = rows.shape[0]
     cand_ids = np.load(os.path.join(PACK_DIR, f"{split}_cand_ids.npy"), mmap_mode="r")
     cand_scores = np.load(os.path.join(PACK_DIR, f"{split}_cand_scores.npy"), mmap_mode="r")
-    chunk_article = np.load(os.path.join(WIKI_DIR, "meta.npy"))[:, 0]
+    content_ids = chunk_content_ids()
     wiki_tokens = np.load(os.path.join(WIKI_DIR, "tokens.npy"), mmap_mode="r")
 
     ref_ids = np.full((R, NUM_WINDOWS), -1, dtype=np.int32)
@@ -230,7 +233,7 @@ def dedup_and_fill(split):
     t0 = time.time()
     n_displaced = 0
     for row_idx in range(R):
-        chunk, score = dedup_row(cand_ids[row_idx], cand_scores[row_idx], chunk_article)
+        chunk, score = dedup_row(cand_ids[row_idx], cand_scores[row_idx], content_ids)
         for w in range(NUM_WINDOWS):
             ref_ids[row_idx, w] = chunk[w]
             ref_scores[row_idx, w] = score[w]
@@ -270,7 +273,7 @@ def _ref_tasks():
     }  # smallest first, so problems show up early
 
 def retrieve_tasks(keys=None, index_gpus=(0, 1, 2), embed_gpu=3, n_ref=8, batch_size=256, force=False):
-    """ Retrieve n_ref distinct-article wiki chunks for every example of each task, in one process.
+    """ Retrieve the n_ref nearest distinct-text wiki chunks for every example of each task, in one process.
     Keys whose {key}.json exists are skipped unless force, so a crashed run resumes. """
     from nanochat.wiki import Retriever
     from tasks.common import REFS_DIR, queries_hash
@@ -307,12 +310,12 @@ def retrieve_tasks(keys=None, index_gpus=(0, 1, 2), embed_gpu=3, n_ref=8, batch_
             json.dump(meta, f)
         valid = scores[scores > -1e8]
         print(f"{key}: {n} queries in {time.time() - t0:.0f}s ({n / max(time.time() - t0, 1e-6):.0f}/s), "
-              f"{n_short} with <{n_ref} articles, score p5/p50/p95 = {np.percentile(valid, [5, 50, 95]).round(3).tolist()}", flush=True)
+              f"{n_short} with <{n_ref} refs, score p5/p50/p95 = {np.percentile(valid, [5, 50, 95]).round(3).tolist()}", flush=True)
 
 # -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Join packed rows' windows to Wikipedia, with article-level dedup")
+    parser = argparse.ArgumentParser(description="Join packed rows' windows to Wikipedia, never repeating a chunk's text")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_ew = sub.add_parser("embed-windows", help="Embed every window of every packed row")
@@ -331,11 +334,11 @@ if __name__ == "__main__":
     p_ss.add_argument("--world-size", type=int, default=6)
     p_ss.add_argument("--gpu", type=int, default=None)
 
-    p_sm = sub.add_parser("search-merge", help="Merge shards' local top-K into each window's top distinct-article candidates")
+    p_sm = sub.add_parser("search-merge", help="Merge shards' local top-K into each window's top distinct-text candidates")
     p_sm.add_argument("--split", choices=["train", "val"], required=True)
     p_sm.add_argument("--world-size", type=int, default=6)
 
-    p_dedup = sub.add_parser("dedup", help="Resolve article-level conflicts and fill the packed rows' wiki columns")
+    p_dedup = sub.add_parser("dedup", help="Resolve repeated-chunk conflicts and fill the packed rows' wiki columns")
     p_dedup.add_argument("--split", choices=["train", "val"], required=True)
 
     p_t = sub.add_parser("tasks", help="Retrieve wiki refs for SFT / eval task conversations")
